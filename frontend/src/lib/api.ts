@@ -51,11 +51,49 @@ export interface HoldingStock {
   weight: number;
 }
 
+export interface TradeStock {
+  code: string;
+  name: string;
+}
+
+export interface StockTradeDetail {
+  code: string;
+  name: string;
+  // 买入
+  buy_date: string;
+  buy_time: string;
+  buy_price: number;
+  shares: number;
+  lots: number;
+  buy_amount: number;
+  // 卖出（null = 仍持有）
+  sell_date: string | null;
+  sell_time: string | null;
+  sell_price: number | null;
+  sell_amount: number | null;
+  // 结果
+  hold_days: number | null;
+  profit: number | null;
+  return_pct: number | null;
+}
+
+export interface TradeRecord {
+  rebalance_date: string;
+  exec_date: string;
+  bought: StockTradeDetail[];
+  sold: StockTradeDetail[];
+  held: TradeStock[];
+  portfolio_size: number;
+  turnover_ratio: number;
+  trade_cost_pct: number;
+}
+
 export interface BacktestResult {
   params: BacktestParams;
   metrics: PerformanceMetrics;
   nav_series: NavPoint[];
   current_holdings: HoldingStock[];
+  trade_records: TradeRecord[];
 }
 
 // ── API 调用 ──

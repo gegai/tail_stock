@@ -1,4 +1,4 @@
-import { Button, Card, DatePicker, Form, InputNumber, Select, Slider, Tooltip, Divider } from "antd";
+import { Button, Card, DatePicker, Form, InputNumber, Select, Tooltip, Divider } from "antd";
 import { QuestionCircleOutlined, ThunderboltOutlined } from "@ant-design/icons";
 import dayjs, { type Dayjs } from "dayjs";
 import type { BacktestParams } from "../../lib/api";
@@ -54,9 +54,9 @@ export function ParamsPanel({ onRun, loading }: Props) {
           min_volume_ratio: 1.2,
           max_amplitude: 5,
           limitup_lookback: 20,
-          max_positions: 20,
+          max_positions: 5,
           frequency: "weekly",
-          initial_capital: 1_000_000,
+          initial_capital: 100_000,
           commission_rate: 15,
         }}
       >
@@ -121,7 +121,7 @@ export function ParamsPanel({ onRun, loading }: Props) {
           label={<span>最大持仓数量{tip("满足条件的股票超过此数时，按换手率降序截取")}</span>}
           name="max_positions"
         >
-          <Slider min={5} max={100} step={5} marks={{ 5: "5", 20: "20", 50: "50", 100: "100" }} />
+          <InputNumber style={{ width: "100%" }} min={1} max={100} step={1} addonAfter="只" />
         </Form.Item>
 
         {/* 换仓频率 */}

@@ -1,2 +1,39 @@
+# IDE / Editor
 .claude
 .vscode
+.idea
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Node
+node_modules/
+dist/
+.cache/
+
+# Data files (大文件本地存储，不入库)
+*.parquet
+*.duckdb
+*.db
+data/
+data_cache/
+
+# OS
+.DS_Store
+Thumbs.db

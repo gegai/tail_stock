@@ -13,12 +13,6 @@ class Settings(BaseSettings):
     # Parquet data directory (contains stock_daily.parquet, stock_basic_data.parquet)
     data_dir: Path = Path("D:/行情数据")
 
-    # SQLite database URL
-    db_url: str = "sqlite+aiosqlite:///./tail_sock.db"
-
-    # Cache directory for intermediate data
-    cache_dir: Path = Path("data_cache")
-
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
     risk_free_rate: float = 0.03

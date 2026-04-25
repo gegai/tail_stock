@@ -9,7 +9,7 @@ import numpy as np
 
 from ..models.schemas import (
     BacktestParams, BacktestResult, PerformanceMetrics,
-    NavPoint, HoldingStock,
+    NavPoint, HoldingStock, TradeRecord, TradeStock, StockTradeDetail,
 )
 from .data_fetcher import (
     get_stock_universe, build_ohlcv_panels, get_benchmark_hist,
@@ -130,7 +130,19 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
     portfolio: list = []
     prev_portfolio: list = []
     daily_nav: dict = {}
-    pending_map: dict = {}  # exec_date -> new_portfolio
+    pending_map: dict = {}       # exec_date -> (rebalance_date, new_portfolio)
+    trade_records: list = []
+    # code -> (buy_date_str, buy_price, shares) — tracks entry info for all held positions
+    position_entry: dict[str, tuple[str, float, int]] = {}
+
+    name_map: dict[str, str] = dict(zip(universe["code"], universe["name"]))
+
+    def _name(code: str) -> str:
+        return str(name_map.get(code, code))
+
+    def _safe_price(series: pd.Series, code: str) -> float:
+        v = series.get(code, float("nan"))
+        return float(v) if pd.notna(v) and float(v) > 0 else 0.0
 
     for i, td in enumerate(all_trading_days):
 
@@ -148,17 +160,96 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
                     params=params,
                 )
                 exec_date = execution_map.get(td, td)
-                pending_map[exec_date] = new_codes
+                pending_map[exec_date] = (td, new_codes)
 
         # T+1 day: execute rebalance at open prices
         if td in execution_set and td in pending_map:
-            new_portfolio = pending_map.pop(td)
+            rebal_date, new_portfolio = pending_map.pop(td)
             if new_portfolio:
                 prev_set = set(prev_portfolio)
                 new_set = set(new_portfolio)
-                if prev_set | new_set:
-                    turnover = len(prev_set.symmetric_difference(new_set)) / len(prev_set | new_set)
-                    nav_value *= (1 - turnover * params.commission_rate)
+                all_involved = prev_set | new_set
+                if all_involved:
+                    changed = len(prev_set.symmetric_difference(new_set))
+                    turnover_ratio = changed / len(all_involved)
+                    cost_pct = turnover_ratio * params.commission_rate * 100
+                    nav_value *= (1 - turnover_ratio * params.commission_rate)
+                else:
+                    turnover_ratio, cost_pct = 0.0, 0.0
+
+                # Open prices on exec day for buy/sell pricing
+                open_row = (
+                    panel_open.loc[td] if (not panel_open.empty and td in panel_open.index)
+                    else pd.Series(dtype=float)
+                )
+                exec_date_str = str(td.date())
+                exec_time_str = "09:30"  # A股开盘集合竞价成交时间
+
+                bought_codes = sorted(new_set - prev_set)
+                sold_codes = sorted(prev_set - new_set)
+                held_codes = sorted(prev_set & new_set)
+
+                # Per-stock allocation based on current portfolio value and equal weight
+                portfolio_value = nav_value * params.initial_capital
+                per_stock_alloc = portfolio_value / len(new_portfolio) if new_portfolio else 0.0
+
+                # Build bought details and record position entries
+                bought_details: list[StockTradeDetail] = []
+                for code in bought_codes:
+                    buy_price = _safe_price(open_row, code)
+                    if buy_price > 0:
+                        lots = int(per_stock_alloc / buy_price / 100)
+                        shares = lots * 100
+                        buy_amount = round(shares * buy_price, 2)
+                    else:
+                        lots = shares = 0
+                        buy_amount = 0.0
+                    bought_details.append(StockTradeDetail(
+                        code=code, name=_name(code),
+                        buy_date=exec_date_str, buy_time=exec_time_str,
+                        buy_price=round(buy_price, 3),
+                        shares=shares, lots=lots, buy_amount=buy_amount,
+                    ))
+                    position_entry[code] = (exec_date_str, buy_price, shares)
+
+                # Build sold details using recorded entry info
+                sold_details: list[StockTradeDetail] = []
+                for code in sold_codes:
+                    sell_price = _safe_price(open_row, code)
+                    buy_date_str, buy_price, shares = position_entry.pop(
+                        code, (exec_date_str, 0.0, 0)
+                    )
+                    lots = shares // 100
+                    buy_amount = round(shares * buy_price, 2)
+                    if buy_price > 0 and sell_price > 0 and shares > 0:
+                        sell_amount = round(shares * sell_price, 2)
+                        profit = round(sell_amount - buy_amount, 2)
+                        ret = round((sell_price / buy_price - 1) * 100, 2)
+                        hold_days = (td - pd.Timestamp(buy_date_str)).days
+                    else:
+                        sell_amount = profit = None
+                        ret = hold_days = None
+                    sold_details.append(StockTradeDetail(
+                        code=code, name=_name(code),
+                        buy_date=buy_date_str, buy_time=exec_time_str,
+                        buy_price=round(buy_price, 3),
+                        shares=shares, lots=lots, buy_amount=buy_amount,
+                        sell_date=exec_date_str, sell_time=exec_time_str,
+                        sell_price=round(sell_price, 3) if sell_price > 0 else None,
+                        sell_amount=sell_amount,
+                        hold_days=hold_days, profit=profit, return_pct=ret,
+                    ))
+
+                trade_records.append(TradeRecord(
+                    rebalance_date=str(rebal_date.date()),
+                    exec_date=exec_date_str,
+                    bought=bought_details,
+                    sold=sold_details,
+                    held=[TradeStock(code=c, name=_name(c)) for c in held_codes],
+                    portfolio_size=len(new_portfolio),
+                    turnover_ratio=round(turnover_ratio, 4),
+                    trade_cost_pct=round(cost_pct, 4),
+                ))
 
                 prev_portfolio = new_portfolio
                 portfolio = new_portfolio
@@ -253,8 +344,9 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
         ))
     holdings.sort(key=lambda x: x.turnover_rate, reverse=True)
 
-    logger.info(f"Done. ann_ret={metrics.annualized_return:.2%}, holdings={len(holdings)}")
+    logger.info(f"Done. ann_ret={metrics.annualized_return:.2%}, holdings={len(holdings)}, trades={len(trade_records)}")
     return BacktestResult(
         params=params, metrics=metrics,
         nav_series=nav_points, current_holdings=holdings,
+        trade_records=list(reversed(trade_records)),  # 最新换仓排在最前
     )

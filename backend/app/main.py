@@ -18,7 +18,6 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    settings.cache_dir.mkdir(parents=True, exist_ok=True)
     yield
 
 

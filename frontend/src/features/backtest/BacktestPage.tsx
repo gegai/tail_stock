@@ -4,6 +4,7 @@ import { ParamsPanel } from "./ParamsPanel";
 import { StatsCards } from "./StatsCards";
 import { NavChart } from "./NavChart";
 import { DrawdownChart } from "./DrawdownChart";
+import { TradeTable } from "./TradeTable";
 import { HoldingsTable } from "../portfolio/HoldingsTable";
 import { TodayPage } from "../portfolio/TodayPage";
 import { DataPanel } from "../data/DataPanel";
@@ -17,10 +18,6 @@ function BacktestTab({ dataReady }: { dataReady: boolean }) {
   const [error, setError] = useState<string | null>(null);
 
   const handleRun = async (params: BacktestParams) => {
-    if (!dataReady) {
-      setError("请先在「数据管理」标签拉取历史数据");
-      return;
-    }
     setLoading(true);
     setError(null);
     try {
@@ -42,8 +39,8 @@ function BacktestTab({ dataReady }: { dataReady: boolean }) {
         <Space direction="vertical" size={16} style={{ width: "100%" }}>
           {!dataReady && (
             <Alert
-              type="warning"
-              message="请先切换到「数据管理」标签拉取历史数据，再运行回测"
+              type="info"
+              message="本地行情数据加载中，若回测失败请检查「数据管理」标签中的数据状态"
               showIcon
             />
           )}
@@ -91,6 +88,7 @@ function BacktestTab({ dataReady }: { dataReady: boolean }) {
               >
                 <HoldingsTable holdings={result.current_holdings} />
               </Card>
+              <TradeTable records={result.trade_records} />
             </>
           )}
         </Space>
