@@ -14,7 +14,7 @@ class BacktestParams(BaseModel):
     limitup_lookback: int = Field(default=20, ge=5, le=60, description="涨停回看天数")
     max_positions: int = Field(default=5, ge=1, le=100, description="最大持仓数量")
 
-    frequency: Literal["daily", "weekly", "monthly"] = Field(default="weekly")
+    frequency: Literal["daily", "weekly", "monthly"] = Field(default="daily")
     initial_capital: float = Field(default=100_000.0, ge=10_000)
     commission_rate: float = Field(default=0.0015, ge=0, le=0.01, description="单边手续费率")
 
@@ -50,22 +50,21 @@ class HoldingStock(BaseModel):
 class StockTradeDetail(BaseModel):
     code: str
     name: str
-    # 买入
+    # 买入：T日尾盘 14:50 买入，用收盘价
     buy_date: str
-    buy_time: str = "09:30"     # 开盘集合竞价成交时间
-    buy_price: float            # T+1 开盘价
-    shares: int = 0             # 买入股数（100的倍数）
-    lots: int = 0               # 手数（shares / 100）
-    buy_amount: float = 0.0     # 买入金额（元）
-    # 卖出（None 表示仍持有）
+    buy_time: str = "14:50"
+    buy_price: float
+    shares: int = 0
+    lots: int = 0
+    buy_amount: float = 0.0
+    # 卖出：T+1日开盘 09:30 卖出，用开盘价
     sell_date: str | None = None
     sell_time: str | None = None
     sell_price: float | None = None
-    sell_amount: float | None = None   # 卖出金额（元）
     # 结果
     hold_days: int | None = None
-    profit: float | None = None        # 绝对收益（元）
-    return_pct: float | None = None    # 收益率（%）
+    profit: float | None = None
+    return_pct: float | None = None
 
 
 class TradeStock(BaseModel):
@@ -74,14 +73,14 @@ class TradeStock(BaseModel):
 
 
 class TradeRecord(BaseModel):
-    rebalance_date: str         # T日：选股日（收盘后）
-    exec_date: str              # T+1日：执行日（开盘买卖）
-    bought: list[StockTradeDetail]   # 新买入（含买入价）
-    sold: list[StockTradeDetail]     # 卖出（含买入价、卖出价、收益）
-    held: list[TradeStock]           # 持续持有（不动）
+    rebalance_date: str         # T日：选股+买入日（14:50收盘价买入）
+    exec_date: str              # T+1日：卖出日（09:30开盘价卖出）
+    bought: list[StockTradeDetail]
+    sold: list[StockTradeDetail]
+    held: list[TradeStock]
     portfolio_size: int
-    turnover_ratio: float       # 换手比例 0-1
-    trade_cost_pct: float       # 交易成本占净值比例（%）
+    turnover_ratio: float
+    trade_cost_pct: float
 
 
 class BacktestResult(BaseModel):

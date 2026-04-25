@@ -55,7 +55,7 @@ export function ParamsPanel({ onRun, loading }: Props) {
           max_amplitude: 5,
           limitup_lookback: 20,
           max_positions: 5,
-          frequency: "weekly",
+          frequency: "daily",
           initial_capital: 100_000,
           commission_rate: 15,
         }}

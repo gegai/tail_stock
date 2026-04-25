@@ -1,9 +1,15 @@
 ﻿"""
-回测引擎：驱动尾盘30分钟选股策略。
-选股日 T（收盘后）-> 执行日 T+1（开盘价成交），消除未来函数。
+回测引擎：尾盘30分钟隔夜短线策略。
+
+时序：
+  T日 14:50  按5个条件选股，用收盘价买入
+  T+1日 09:30 开盘卖出
+
+每个rebalance日既是买入日也是卖出日（先卖后买）：
+  09:30 - 卖出昨日持仓（open价格）
+  14:50 - 买入今日新仓（close价格）
 """
 import logging
-from datetime import date
 import pandas as pd
 import numpy as np
 
@@ -16,8 +22,7 @@ from .data_fetcher import (
     build_volume_ratio, build_recent_limitup, build_benchmark_volume_ratio,
 )
 from .strategy import (
-    get_rebalance_dates, build_execution_map,
-    is_market_crash, select_by_conditions,
+    get_rebalance_dates, is_market_crash, select_by_conditions,
 )
 from ..core.config import settings
 
@@ -85,10 +90,10 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
     panels = build_ohlcv_panels(all_codes, start_str, end_str)
 
     panel_close = panels.get("close", pd.DataFrame())
-    panel_open = panels.get("open", pd.DataFrame())
-    panel_turnover = panels.get("turnover", pd.DataFrame())
-    panel_amplitude = panels.get("amplitude", pd.DataFrame())
-    panel_pct_chg = panels.get("pct_chg", pd.DataFrame())
+    panel_open  = panels.get("open",  pd.DataFrame())
+    panel_turnover   = panels.get("turnover",     pd.DataFrame())
+    panel_amplitude  = panels.get("amplitude",    pd.DataFrame())
+    panel_pct_chg    = panels.get("pct_chg",      pd.DataFrame())
 
     if panel_close.empty:
         raise ValueError("价格数据为空，请检查 DATA_DIR 路径和 parquet 文件")
@@ -100,25 +105,20 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
 
     panel_had_limitup = build_recent_limitup(panel_pct_chg, lookback=params.limitup_lookback)
 
-    # 3. Benchmark (optional — empty means skip market crash filter)
+    # 3. Benchmark (optional)
     benchmark_raw = get_benchmark_hist(start_str, end_str)
     if benchmark_raw.empty:
-        logger.info("No benchmark data; market crash filter disabled")
         benchmark_df = pd.DataFrame()
     else:
         benchmark_df = benchmark_raw.set_index("date").sort_index()
-        bench_vol_ratio = build_benchmark_volume_ratio(benchmark_df)
-        benchmark_df["vol_ratio"] = bench_vol_ratio
+        benchmark_df["vol_ratio"] = build_benchmark_volume_ratio(benchmark_df)
 
-    # 4. Rebalance / execution dates
+    # 4. Rebalance dates
     trading_days = panel_close.index
     rebalance_dates = get_rebalance_dates(
         trading_days, params.start_date, params.end_date, params.frequency
     )
-    execution_map = build_execution_map(rebalance_dates, trading_days)
-
     rebalance_set = set(rebalance_dates)
-    execution_set = set(execution_map.values())
 
     all_trading_days = trading_days[
         (trading_days >= pd.Timestamp(params.start_date)) &
@@ -127,12 +127,10 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
 
     # 5. Main simulation loop
     nav_value = 1.0
-    portfolio: list = []
-    prev_portfolio: list = []
+    portfolio: list = []          # current overnight holdings
     daily_nav: dict = {}
-    pending_map: dict = {}       # exec_date -> (rebalance_date, new_portfolio)
     trade_records: list = []
-    # code -> (buy_date_str, buy_price, shares) — tracks entry info for all held positions
+    # code -> (buy_date_str, buy_price, shares)
     position_entry: dict[str, tuple[str, float, int]] = {}
 
     name_map: dict[str, str] = dict(zip(universe["code"], universe["name"]))
@@ -145,11 +143,40 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
         return float(v) if pd.notna(v) and float(v) > 0 else 0.0
 
     for i, td in enumerate(all_trading_days):
+        td_str = str(td.date())
 
-        # T day: select stocks after close
+        open_row = (
+            panel_open.loc[td]
+            if (not panel_open.empty and td in panel_open.index)
+            else pd.Series(dtype=float)
+        )
+        close_row = (
+            panel_close.loc[td]
+            if (not panel_close.empty and td in panel_close.index)
+            else pd.Series(dtype=float)
+        )
+
+        # ── Step A: 09:30 卖出昨日持仓（overnight return: close_{T-1} → open_T） ──
+        if portfolio and i > 0:
+            prev_td = all_trading_days[i - 1]
+            if prev_td in panel_close.index:
+                close_prev = panel_close.loc[prev_td]
+                codes_c = [c for c in portfolio if c in close_prev.index and c in open_row.index]
+                if codes_c:
+                    c_prev = close_prev[codes_c].dropna()
+                    o_cur  = open_row[codes_c].dropna()
+                    common = c_prev.index.intersection(o_cur.index)
+                    if len(common) > 0:
+                        overnight_ret = float((o_cur[common] / c_prev[common] - 1).mean())
+                        nav_value *= (1 + overnight_ret)
+                        logger.debug(f"{td_str} overnight ret={overnight_ret:.4%}")
+
+        # ── Step B: 14:50 选股（rebalance日） ──
+        new_portfolio = portfolio  # 默认保持不变（非换仓日持现金或不操作）
+
         if td in rebalance_set:
             if not is_market_crash(td, benchmark_df):
-                new_codes = select_by_conditions(
+                new_portfolio = select_by_conditions(
                     date=td,
                     universe=universe,
                     panel_close=panel_close,
@@ -159,90 +186,76 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
                     panel_had_limitup=panel_had_limitup,
                     params=params,
                 )
-                exec_date = execution_map.get(td, td)
-                pending_map[exec_date] = (td, new_codes)
+            else:
+                new_portfolio = []  # 大盘放量大跌：当日不买，空仓过夜
 
-        # T+1 day: execute rebalance at open prices
-        if td in execution_set and td in pending_map:
-            rebal_date, new_portfolio = pending_map.pop(td)
-            if new_portfolio:
-                prev_set = set(prev_portfolio)
-                new_set = set(new_portfolio)
-                all_involved = prev_set | new_set
-                if all_involved:
-                    changed = len(prev_set.symmetric_difference(new_set))
-                    turnover_ratio = changed / len(all_involved)
-                    cost_pct = turnover_ratio * params.commission_rate * 100
-                    nav_value *= (1 - turnover_ratio * params.commission_rate)
-                else:
-                    turnover_ratio, cost_pct = 0.0, 0.0
+        # ── Step C: 换仓记账 & 14:50 买入新仓 ──
+        if td in rebalance_set:
+            prev_set = set(portfolio)
+            new_set  = set(new_portfolio)
+            all_involved = prev_set | new_set
 
-                # Open prices on exec day for buy/sell pricing
-                open_row = (
-                    panel_open.loc[td] if (not panel_open.empty and td in panel_open.index)
-                    else pd.Series(dtype=float)
-                )
-                exec_date_str = str(td.date())
-                exec_time_str = "09:30"  # A股开盘集合竞价成交时间
+            if all_involved:
+                changed = len(prev_set.symmetric_difference(new_set))
+                turnover_ratio = changed / len(all_involved)
+                cost_pct = turnover_ratio * params.commission_rate * 100
+                nav_value *= (1 - turnover_ratio * params.commission_rate)
+            else:
+                turnover_ratio = cost_pct = 0.0
 
-                bought_codes = sorted(new_set - prev_set)
-                sold_codes = sorted(prev_set - new_set)
-                held_codes = sorted(prev_set & new_set)
+            sold_codes   = sorted(prev_set - new_set)
+            bought_codes = sorted(new_set  - prev_set)
+            held_codes   = sorted(prev_set & new_set)
 
-                # Per-stock allocation based on current portfolio value and equal weight
-                portfolio_value = nav_value * params.initial_capital
-                per_stock_alloc = portfolio_value / len(new_portfolio) if new_portfolio else 0.0
+            portfolio_value  = nav_value * params.initial_capital
+            per_stock_alloc  = portfolio_value / len(new_portfolio) if new_portfolio else 0.0
 
-                # Build bought details and record position entries
-                bought_details: list[StockTradeDetail] = []
-                for code in bought_codes:
-                    buy_price = _safe_price(open_row, code)
-                    if buy_price > 0:
-                        lots = int(per_stock_alloc / buy_price / 100)
-                        shares = lots * 100
-                        buy_amount = round(shares * buy_price, 2)
-                    else:
-                        lots = shares = 0
-                        buy_amount = 0.0
-                    bought_details.append(StockTradeDetail(
-                        code=code, name=_name(code),
-                        buy_date=exec_date_str, buy_time=exec_time_str,
-                        buy_price=round(buy_price, 3),
-                        shares=shares, lots=lots, buy_amount=buy_amount,
-                    ))
-                    position_entry[code] = (exec_date_str, buy_price, shares)
-
-                # Build sold details using recorded entry info
-                sold_details: list[StockTradeDetail] = []
-                for code in sold_codes:
-                    sell_price = _safe_price(open_row, code)
-                    buy_date_str, buy_price, shares = position_entry.pop(
-                        code, (exec_date_str, 0.0, 0)
-                    )
-                    lots = shares // 100
+            # 买入明细（close价格，14:50）
+            bought_details: list[StockTradeDetail] = []
+            for code in bought_codes:
+                buy_price = _safe_price(close_row, code)
+                if buy_price > 0:
+                    lots   = int(per_stock_alloc / buy_price / 100)
+                    shares = lots * 100
                     buy_amount = round(shares * buy_price, 2)
-                    if buy_price > 0 and sell_price > 0 and shares > 0:
-                        sell_amount = round(shares * sell_price, 2)
-                        profit = round(sell_amount - buy_amount, 2)
-                        ret = round((sell_price / buy_price - 1) * 100, 2)
-                        hold_days = (td - pd.Timestamp(buy_date_str)).days
-                    else:
-                        sell_amount = profit = None
-                        ret = hold_days = None
-                    sold_details.append(StockTradeDetail(
-                        code=code, name=_name(code),
-                        buy_date=buy_date_str, buy_time=exec_time_str,
-                        buy_price=round(buy_price, 3),
-                        shares=shares, lots=lots, buy_amount=buy_amount,
-                        sell_date=exec_date_str, sell_time=exec_time_str,
-                        sell_price=round(sell_price, 3) if sell_price > 0 else None,
-                        sell_amount=sell_amount,
-                        hold_days=hold_days, profit=profit, return_pct=ret,
-                    ))
+                else:
+                    lots = shares = 0
+                    buy_amount = 0.0
+                bought_details.append(StockTradeDetail(
+                    code=code, name=_name(code),
+                    buy_date=td_str, buy_time="14:50",
+                    buy_price=round(buy_price, 3),
+                    shares=shares, lots=lots, buy_amount=buy_amount,
+                ))
+                position_entry[code] = (td_str, buy_price, shares)
 
+            # 卖出明细（open价格，09:30）
+            sold_details: list[StockTradeDetail] = []
+            for code in sold_codes:
+                sell_price = _safe_price(open_row, code)
+                buy_date_str, buy_price, shares = position_entry.pop(code, (td_str, 0.0, 0))
+                lots       = shares // 100
+                buy_amount = round(shares * buy_price, 2)
+                if buy_price > 0 and sell_price > 0 and shares > 0:
+                    profit    = round(shares * sell_price - buy_amount, 2)
+                    ret       = round((sell_price / buy_price - 1) * 100, 2)
+                    hold_days = (td - pd.Timestamp(buy_date_str)).days
+                else:
+                    profit = ret = hold_days = None
+                sold_details.append(StockTradeDetail(
+                    code=code, name=_name(code),
+                    buy_date=buy_date_str, buy_time="14:50",
+                    buy_price=round(buy_price, 3),
+                    shares=shares, lots=lots, buy_amount=buy_amount,
+                    sell_date=td_str, sell_time="09:30",
+                    sell_price=round(sell_price, 3) if sell_price > 0 else None,
+                    hold_days=hold_days, profit=profit, return_pct=ret,
+                ))
+
+            if bought_details or sold_details:
                 trade_records.append(TradeRecord(
-                    rebalance_date=str(rebal_date.date()),
-                    exec_date=exec_date_str,
+                    rebalance_date=td_str,
+                    exec_date=td_str,   # 同一天：09:30卖出，14:50买入
                     bought=bought_details,
                     sold=sold_details,
                     held=[TradeStock(code=c, name=_name(c)) for c in held_codes],
@@ -251,30 +264,7 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
                     trade_cost_pct=round(cost_pct, 4),
                 ))
 
-                prev_portfolio = new_portfolio
-                portfolio = new_portfolio
-
-                if (not panel_open.empty and not panel_close.empty
-                        and td in panel_open.index and td in panel_close.index):
-                    opens = panel_open.loc[td, portfolio].dropna()
-                    closes = panel_close.loc[td, portfolio].dropna()
-                    common = opens.index.intersection(closes.index)
-                    if len(common) > 0:
-                        open_to_close = (closes[common] / opens[common] - 1).mean()
-                        nav_value *= (1 + open_to_close)
-                    daily_nav[td] = nav_value
-                    continue
-
-        # Non-execution day: close-to-close return
-        if portfolio and i > 0:
-            prev_td = all_trading_days[i - 1]
-            if prev_td in panel_close.index and td in panel_close.index:
-                prev_p = panel_close.loc[prev_td, portfolio].dropna()
-                curr_p = panel_close.loc[td, portfolio].dropna()
-                common = prev_p.index.intersection(curr_p.index)
-                if len(common) > 0:
-                    daily_ret = (curr_p[common] / prev_p[common] - 1).mean()
-                    nav_value *= (1 + daily_ret)
+            portfolio = new_portfolio
 
         daily_nav[td] = nav_value
 
@@ -284,7 +274,7 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
         raise ValueError("回测结果为空，请检查参数或数据")
     nav_series = nav_series / nav_series.iloc[0]
 
-    # 7. Benchmark NAV (flat 1.0 when no benchmark available)
+    # 7. Benchmark NAV
     if not benchmark_df.empty and "close" in benchmark_df.columns:
         bench_close = benchmark_df["close"].reindex(nav_series.index, method="ffill")
         benchmark_nav = bench_close / bench_close.iloc[0]
@@ -309,19 +299,9 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
         if ts in benchmark_nav.index and not np.isnan(float(benchmark_nav[ts]))
     ]
 
-    # 11. Current holdings (last rebalance date)
+    # 11. Current holdings (最后一次选股结果)
     last_rebal = max(rebalance_dates) if rebalance_dates else all_trading_days[-1]
-    current_codes = select_by_conditions(
-        date=last_rebal,
-        universe=universe,
-        panel_close=panel_close,
-        panel_turnover=panel_turnover,
-        panel_volume_ratio=panel_volume_ratio,
-        panel_amplitude=panel_amplitude,
-        panel_had_limitup=panel_had_limitup,
-        params=params,
-    )
-
+    current_codes = portfolio  # 最后持仓即当前持仓
     u_idx = universe.set_index("code")
     weight = 1.0 / len(current_codes) if current_codes else 0.0
     avail_turn = panel_turnover.index[panel_turnover.index <= last_rebal]
@@ -329,7 +309,7 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
 
     holdings = []
     for code in current_codes:
-        name = str(u_idx.loc[code, "name"]) if code in u_idx.index else code
+        name   = str(u_idx.loc[code, "name"]) if code in u_idx.index else code
         mktcap = float(u_idx.loc[code, "float_mktcap"]) if (
             code in u_idx.index and "float_mktcap" in u_idx.columns
         ) else 0.0
@@ -344,9 +324,12 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
         ))
     holdings.sort(key=lambda x: x.turnover_rate, reverse=True)
 
-    logger.info(f"Done. ann_ret={metrics.annualized_return:.2%}, holdings={len(holdings)}, trades={len(trade_records)}")
+    logger.info(
+        f"Done. ann_ret={metrics.annualized_return:.2%}, "
+        f"holdings={len(holdings)}, trades={len(trade_records)}"
+    )
     return BacktestResult(
         params=params, metrics=metrics,
         nav_series=nav_points, current_holdings=holdings,
-        trade_records=list(reversed(trade_records)),  # 最新换仓排在最前
+        trade_records=list(reversed(trade_records)),
     )
