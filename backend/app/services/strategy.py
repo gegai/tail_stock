@@ -18,6 +18,21 @@ import logging
 
 from ..models.schemas import BacktestParams
 
+
+def compute_score(
+    turnover_rate: float,
+    volume_ratio: float,
+    float_mktcap: float,
+    amplitude: float,
+    params: BacktestParams,
+) -> float:
+    """综合评分 0-100（换手率40 + 量比30 + 市值20 + 振幅10）。"""
+    s_turn = min(turnover_rate / max(params.min_turnover_rate, 0.01), 2.0) / 2.0 * 40
+    s_vr   = min(volume_ratio / max(params.min_volume_ratio,   0.1),  2.0) / 2.0 * 30
+    s_mktcap = max(1.0 - float_mktcap / max(params.max_float_mktcap, 1.0), 0.0) * 20
+    s_amp    = max(1.0 - amplitude    / max(params.max_amplitude,     0.1), 0.0) * 10
+    return round(s_turn + s_vr + s_mktcap + s_amp, 1)
+
 logger = logging.getLogger(__name__)
 
 
@@ -194,9 +209,20 @@ def select_by_conditions(
     if not codes:
         return []
 
-    # 超出 max_positions → 按换手率降序截取
+    # 超出 max_positions → 按综合得分降序截取
     if len(codes) > params.max_positions:
-        turn_vals = turnover_row.reindex(codes).fillna(0)
-        codes = turn_vals.nlargest(params.max_positions).index.tolist()
+        mktcap_col = dict(zip(universe["code"], universe["float_mktcap"].fillna(0)))
+        scored = sorted(
+            codes,
+            key=lambda c: compute_score(
+                float(turnover_row.get(c, 0) or 0),
+                float(vr_row.get(c, 0) or 0),
+                mktcap_col.get(c, 0.0),
+                float(amp_row.get(c, 0) or 0),
+                params,
+            ),
+            reverse=True,
+        )
+        codes = scored[: params.max_positions]
 
     return codes

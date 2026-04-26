@@ -18,7 +18,7 @@ from .data_fetcher import (
 )
 from .strategy import (
     get_rebalance_dates, build_execution_map,
-    is_market_crash, select_by_conditions,
+    is_market_crash, select_by_conditions, compute_score,
 )
 from ..core.config import settings
 
@@ -273,15 +273,20 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
                     return round(float(v), 3) if pd.notna(v) else 0.0
 
                 sel_entries = []
+                bought_set = set(bought_codes)
                 for code in sorted(bought_codes + held_codes):
-                    status = "买入" if code in set(bought_codes) else "持有"
+                    status = "买入" if code in bought_set else "持有"
+                    tr   = _sel_val(panel_turnover,      rebal_date, code)
+                    vr   = _sel_val(panel_volume_ratio,  rebal_date, code)
+                    amp  = _sel_val(panel_amplitude,     rebal_date, code)
+                    mktcap = round(mktcap_map.get(code, 0.0), 2)
                     sel_entries.append(SelectionEntry(
                         code=code, name=_name(code), status=status,
-                        float_mktcap=round(mktcap_map.get(code, 0.0), 2),
-                        turnover_rate=_sel_val(panel_turnover, rebal_date, code),
-                        volume_ratio=_sel_val(panel_volume_ratio, rebal_date, code),
-                        amplitude=_sel_val(panel_amplitude, rebal_date, code),
+                        float_mktcap=mktcap,
+                        turnover_rate=tr, volume_ratio=vr, amplitude=amp,
+                        score=compute_score(tr, vr, mktcap, amp, params),
                     ))
+                sel_entries.sort(key=lambda e: e.score, reverse=True)
                 selection_log.append(SelectionRecord(
                     date=str(rebal_date.date()),
                     stocks=sel_entries,

@@ -8,7 +8,26 @@ interface Props {
   records: SelectionRecord[];
 }
 
+/** 将 0-100 分映射为颜色：>= 80 金色，>= 60 蓝色，其余灰色 */
+function scoreColor(v: number) {
+  if (v >= 80) return "#d48806";
+  if (v >= 60) return "#1677ff";
+  return "#595959";
+}
+
 const cols = [
+  {
+    title: "综合分",
+    dataIndex: "score",
+    key: "score",
+    width: 70,
+    align: "right" as const,
+    render: (v: number) => (
+      <Text style={{ fontSize: 12, fontWeight: 600, color: scoreColor(v ?? 0) }}>
+        {(v ?? 0).toFixed(1)}
+      </Text>
+    ),
+  },
   {
     title: "状态",
     dataIndex: "status",
@@ -129,7 +148,7 @@ export function SelectionLog({ records }: Props) {
               rowKey="code"
               size="small"
               pagination={false}
-              scroll={{ x: 620 }}
+              scroll={{ x: 690 }}
             />
           </Space>
         ),

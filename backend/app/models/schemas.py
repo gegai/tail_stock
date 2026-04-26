@@ -85,6 +85,7 @@ class SelectionEntry(BaseModel):
     turnover_rate: float     # %
     volume_ratio: float
     amplitude: float         # %
+    score: float = 0.0       # 综合评分 0-100
 
 
 class SelectionRecord(BaseModel):

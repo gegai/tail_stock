@@ -97,6 +97,7 @@ export interface SelectionEntry {
   turnover_rate: number;
   volume_ratio: number;
   amplitude: number;
+  score: number;
 }
 
 export interface SelectionRecord {

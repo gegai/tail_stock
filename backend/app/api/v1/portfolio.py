@@ -74,9 +74,24 @@ def _check_limitup(codes: list, ref_date: pd.Timestamp, lookback: int) -> set:
         return set(codes)
 
 
+def _compute_scores(df: pd.DataFrame, params: BacktestParams) -> pd.Series:
+    s_turn = (
+        df["turnover_rate"].clip(upper=params.min_turnover_rate * 2)
+        / (params.min_turnover_rate * 2)
+    ) * 40
+    s_vr = (
+        df["volume_ratio"].clip(upper=params.min_volume_ratio * 2)
+        / (params.min_volume_ratio * 2)
+    ) * 30
+    s_mktcap = ((1 - df["float_mktcap"] / params.max_float_mktcap).clip(lower=0)) * 20
+    s_amp    = ((1 - df["amplitude"]     / params.max_amplitude).clip(lower=0))    * 10
+    return s_turn + s_vr + s_mktcap + s_amp
+
+
 def _to_holdings(df: pd.DataFrame, params: BacktestParams) -> list[HoldingStock]:
     if len(df) > params.max_positions:
-        df = df.nlargest(params.max_positions, "turnover_rate")
+        scores = _compute_scores(df, params)
+        df = df.loc[scores.nlargest(params.max_positions).index]
     weight = 1.0 / len(df)
     return [
         HoldingStock(
