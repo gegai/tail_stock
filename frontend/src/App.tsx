@@ -1,6 +1,8 @@
-import { ConfigProvider, theme } from "antd";
+﻿import { ConfigProvider, theme } from "antd";
 import zhCN from "antd/locale/zh_CN";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { BacktestPage } from "./features/backtest/BacktestPage";
+import { StockMinutePage } from "./features/chart/StockMinutePage";
 import "./index.css";
 
 export default function App() {
@@ -15,9 +17,14 @@ export default function App() {
         },
       }}
     >
-      <div style={{ minHeight: "100vh", background: "#f5f7fa" }}>
-        <BacktestPage />
-      </div>
+      <BrowserRouter>
+        <div style={{ minHeight: "100vh", background: "#f5f7fa" }}>
+          <Routes>
+            <Route path="/" element={<BacktestPage />} />
+            <Route path="/stock/:code/:date" element={<StockMinutePage />} />
+          </Routes>
+        </div>
+      </BrowserRouter>
     </ConfigProvider>
   );
 }

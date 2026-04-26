@@ -8,6 +8,7 @@ from .core.database import init_db
 from .api.v1.backtest import router as backtest_router
 from .api.v1.portfolio import router as portfolio_router
 from .api.v1.data import router as data_router
+from .api.v1.chart import router as chart_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +40,7 @@ app.add_middleware(
 app.include_router(data_router, prefix="/api/v1")
 app.include_router(backtest_router, prefix="/api/v1")
 app.include_router(portfolio_router, prefix="/api/v1")
+app.include_router(chart_router, prefix="/api/v1")
 
 
 @app.get("/health")

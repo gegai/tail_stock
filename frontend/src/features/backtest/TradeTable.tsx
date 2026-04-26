@@ -51,6 +51,10 @@ function DetailTable({ record }: { record: TradeRecord }) {
     return <Text type="secondary">本次无买卖操作（仅持仓不变）</Text>;
   }
 
+  const goToChart = (code: string, buy_date: string, name: string) => {
+    window.open(`/stock/${code}/${buy_date}?name=${encodeURIComponent(name)}`, "_blank");
+  };
+
   const fmt = (v: number | null | undefined, decimals = 2, prefix = "") =>
     v != null && v > 0
       ? <Text style={{ fontSize: 12 }}>{prefix}{v.toFixed(decimals)}</Text>
@@ -73,13 +77,28 @@ function DetailTable({ record }: { record: TradeRecord }) {
       dataIndex: "code",
       key: "code",
       width: 80,
-      render: (v: string) => <Text code style={{ fontSize: 12 }}>{v}</Text>,
+      render: (code: string, row: typeof rows[0]) => (
+        <span
+          style={{ cursor: "pointer", color: "#1677ff", fontFamily: "monospace", fontSize: 12 }}
+          onClick={() => goToChart(code, row.buy_date, row.name)}
+        >
+          {code}
+        </span>
+      ),
     },
     {
       title: "名称",
       dataIndex: "name",
       key: "name",
       width: 90,
+      render: (name: string, row: typeof rows[0]) => (
+        <span
+          style={{ cursor: "pointer", color: "#1677ff", fontSize: 12 }}
+          onClick={() => goToChart(row.code, row.buy_date, name)}
+        >
+          {name}
+        </span>
+      ),
     },
     {
       title: "买入时间",

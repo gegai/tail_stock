@@ -14,7 +14,11 @@ class BacktestParams(BaseModel):
     limitup_lookback: int = Field(default=20, ge=5, le=60, description="涨停回看天数")
     max_positions: int = Field(default=5, ge=1, le=100, description="最大持仓数量")
 
-    frequency: Literal["daily", "weekly", "monthly"] = Field(default="weekly")
+    frequency: Literal["daily", "weekly", "monthly"] = Field(default="daily")
+    buy_timing: Literal["t1_open", "t_close"] = Field(
+        default="t1_open",
+        description="t1_open=T+1日09:30开盘价；t_close=T日收盘价（近似14:30尾盘）",
+    )
     initial_capital: float = Field(default=100_000.0, ge=10_000)
     commission_rate: float = Field(default=0.0015, ge=0, le=0.01, description="单边手续费率")
 
@@ -73,6 +77,21 @@ class TradeStock(BaseModel):
     name: str
 
 
+class SelectionEntry(BaseModel):
+    code: str
+    name: str
+    status: str              # "买入" | "持有"
+    float_mktcap: float      # 亿元
+    turnover_rate: float     # %
+    volume_ratio: float
+    amplitude: float         # %
+
+
+class SelectionRecord(BaseModel):
+    date: str                # 选股日（T日）
+    stocks: list[SelectionEntry]
+
+
 class TradeRecord(BaseModel):
     rebalance_date: str         # T日：选股日（收盘后）
     exec_date: str              # T+1日：执行日（开盘买卖）
@@ -90,3 +109,4 @@ class BacktestResult(BaseModel):
     nav_series: list[NavPoint]
     current_holdings: list[HoldingStock]
     trade_records: list[TradeRecord]
+    selection_log: list[SelectionRecord]  # 每个换仓日的完整选股快照（含筛选指标）

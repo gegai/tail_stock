@@ -18,7 +18,7 @@ def _cache_key(params: BacktestParams) -> str:
         f"_{params.max_float_mktcap}_{params.min_turnover_rate}"
         f"_{params.min_volume_ratio}_{params.max_amplitude}"
         f"_{params.limitup_lookback}_{params.max_positions}"
-        f"_{params.frequency}_{params.commission_rate}"
+        f"_{params.frequency}_{params.buy_timing}_{params.commission_rate}"
     )
 
 

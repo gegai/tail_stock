@@ -10,6 +10,7 @@ import numpy as np
 from ..models.schemas import (
     BacktestParams, BacktestResult, PerformanceMetrics,
     NavPoint, HoldingStock, TradeRecord, TradeStock, StockTradeDetail,
+    SelectionEntry, SelectionRecord,
 )
 from .data_fetcher import (
     get_stock_universe, build_ohlcv_panels, get_benchmark_hist,
@@ -132,10 +133,12 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
     daily_nav: dict = {}
     pending_map: dict = {}       # exec_date -> (rebalance_date, new_portfolio)
     trade_records: list = []
-    # code -> (buy_date_str, buy_price, shares) — tracks entry info for all held positions
-    position_entry: dict[str, tuple[str, float, int]] = {}
+    selection_log: list = []
+    # code -> (buy_date_str, buy_time_str, buy_price, shares)
+    position_entry: dict[str, tuple[str, str, float, int]] = {}
 
     name_map: dict[str, str] = dict(zip(universe["code"], universe["name"]))
+    mktcap_map: dict[str, float] = dict(zip(universe["code"], universe["float_mktcap"].fillna(0)))
 
     def _name(code: str) -> str:
         return str(name_map.get(code, code))
@@ -177,26 +180,38 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
                 else:
                     turnover_ratio, cost_pct = 0.0, 0.0
 
-                # Open prices on exec day for buy/sell pricing
+                # Open prices on exec day — always used for SELL pricing
                 open_row = (
                     panel_open.loc[td] if (not panel_open.empty and td in panel_open.index)
                     else pd.Series(dtype=float)
                 )
                 exec_date_str = str(td.date())
-                exec_time_str = "09:30"  # A股开盘集合竞价成交时间
+
+                # BUY price source depends on buy_timing
+                if params.buy_timing == "t_close":
+                    buy_price_row = (
+                        panel_close.loc[rebal_date]
+                        if (not panel_close.empty and rebal_date in panel_close.index)
+                        else pd.Series(dtype=float)
+                    )
+                    buy_date_base = str(rebal_date.date())
+                    buy_time_base = "14:30"
+                else:  # t1_open
+                    buy_price_row = open_row
+                    buy_date_base = exec_date_str
+                    buy_time_base = "09:30"
 
                 bought_codes = sorted(new_set - prev_set)
                 sold_codes = sorted(prev_set - new_set)
                 held_codes = sorted(prev_set & new_set)
 
-                # Per-stock allocation based on current portfolio value and equal weight
                 portfolio_value = nav_value * params.initial_capital
                 per_stock_alloc = portfolio_value / len(new_portfolio) if new_portfolio else 0.0
 
-                # Build bought details and record position entries
+                # Build bought details
                 bought_details: list[StockTradeDetail] = []
                 for code in bought_codes:
-                    buy_price = _safe_price(open_row, code)
+                    buy_price = _safe_price(buy_price_row, code)
                     if buy_price > 0:
                         lots = int(per_stock_alloc / buy_price / 100)
                         shares = lots * 100
@@ -206,18 +221,18 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
                         buy_amount = 0.0
                     bought_details.append(StockTradeDetail(
                         code=code, name=_name(code),
-                        buy_date=exec_date_str, buy_time=exec_time_str,
+                        buy_date=buy_date_base, buy_time=buy_time_base,
                         buy_price=round(buy_price, 3),
                         shares=shares, lots=lots, buy_amount=buy_amount,
                     ))
-                    position_entry[code] = (exec_date_str, buy_price, shares)
+                    position_entry[code] = (buy_date_base, buy_time_base, buy_price, shares)
 
-                # Build sold details using recorded entry info
+                # Build sold details
                 sold_details: list[StockTradeDetail] = []
                 for code in sold_codes:
-                    sell_price = _safe_price(open_row, code)
-                    buy_date_str, buy_price, shares = position_entry.pop(
-                        code, (exec_date_str, 0.0, 0)
+                    sell_price = _safe_price(open_row, code)  # always T+1 open
+                    buy_date_str, orig_buy_time, buy_price, shares = position_entry.pop(
+                        code, (buy_date_base, buy_time_base, 0.0, 0)
                     )
                     lots = shares // 100
                     buy_amount = round(shares * buy_price, 2)
@@ -227,14 +242,13 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
                         ret = round((sell_price / buy_price - 1) * 100, 2)
                         hold_days = (td - pd.Timestamp(buy_date_str)).days
                     else:
-                        sell_amount = profit = None
-                        ret = hold_days = None
+                        sell_amount = profit = ret = hold_days = None
                     sold_details.append(StockTradeDetail(
                         code=code, name=_name(code),
-                        buy_date=buy_date_str, buy_time=exec_time_str,
+                        buy_date=buy_date_str, buy_time=orig_buy_time,
                         buy_price=round(buy_price, 3),
                         shares=shares, lots=lots, buy_amount=buy_amount,
-                        sell_date=exec_date_str, sell_time=exec_time_str,
+                        sell_date=exec_date_str, sell_time="09:30",
                         sell_price=round(sell_price, 3) if sell_price > 0 else None,
                         sell_amount=sell_amount,
                         hold_days=hold_days, profit=profit, return_pct=ret,
@@ -251,19 +265,46 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
                     trade_cost_pct=round(cost_pct, 4),
                 ))
 
+                # Build selection log entry: full portfolio snapshot with screening metrics
+                def _sel_val(panel: pd.DataFrame, d: pd.Timestamp, code: str) -> float:
+                    if panel.empty or d not in panel.index:
+                        return 0.0
+                    v = panel.loc[d].get(code, float("nan"))
+                    return round(float(v), 3) if pd.notna(v) else 0.0
+
+                sel_entries = []
+                for code in sorted(bought_codes + held_codes):
+                    status = "买入" if code in set(bought_codes) else "持有"
+                    sel_entries.append(SelectionEntry(
+                        code=code, name=_name(code), status=status,
+                        float_mktcap=round(mktcap_map.get(code, 0.0), 2),
+                        turnover_rate=_sel_val(panel_turnover, rebal_date, code),
+                        volume_ratio=_sel_val(panel_volume_ratio, rebal_date, code),
+                        amplitude=_sel_val(panel_amplitude, rebal_date, code),
+                    ))
+                selection_log.append(SelectionRecord(
+                    date=str(rebal_date.date()),
+                    stocks=sel_entries,
+                ))
+
                 prev_portfolio = new_portfolio
                 portfolio = new_portfolio
 
-                if (not panel_open.empty and not panel_close.empty
-                        and td in panel_open.index and td in panel_close.index):
-                    opens = panel_open.loc[td, portfolio].dropna()
-                    closes = panel_close.loc[td, portfolio].dropna()
-                    common = opens.index.intersection(closes.index)
-                    if len(common) > 0:
-                        open_to_close = (closes[common] / opens[common] - 1).mean()
-                        nav_value *= (1 + open_to_close)
-                    daily_nav[td] = nav_value
-                    continue
+                # NAV adjustment on execution day:
+                # t1_open: open→close intraday return, then skip close-to-close
+                # t_close: bought at T's close → let close-to-close handle T→T+1 return
+                if params.buy_timing == "t1_open":
+                    if (not panel_open.empty and not panel_close.empty
+                            and td in panel_open.index and td in panel_close.index):
+                        opens = panel_open.loc[td, portfolio].dropna()
+                        closes = panel_close.loc[td, portfolio].dropna()
+                        common = opens.index.intersection(closes.index)
+                        if len(common) > 0:
+                            open_to_close = (closes[common] / opens[common] - 1).mean()
+                            nav_value *= (1 + open_to_close)
+                        daily_nav[td] = nav_value
+                        continue
+                # t_close: fall through to close-to-close below
 
         # Non-execution day: close-to-close return
         if portfolio and i > 0:
@@ -348,5 +389,6 @@ def run_backtest(params: BacktestParams) -> BacktestResult:
     return BacktestResult(
         params=params, metrics=metrics,
         nav_series=nav_points, current_holdings=holdings,
-        trade_records=list(reversed(trade_records)),  # 最新换仓排在最前
+        trade_records=list(reversed(trade_records)),
+        selection_log=list(reversed(selection_log)),
     )

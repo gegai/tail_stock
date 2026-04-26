@@ -19,6 +19,7 @@ export interface BacktestParams {
   limitup_lookback: number;
   max_positions: number;
   frequency: "daily" | "weekly" | "monthly";
+  buy_timing: "t1_open" | "t_close";
   initial_capital: number;
   commission_rate: number;
 }
@@ -88,12 +89,28 @@ export interface TradeRecord {
   trade_cost_pct: number;
 }
 
+export interface SelectionEntry {
+  code: string;
+  name: string;
+  status: "买入" | "持有";
+  float_mktcap: number;
+  turnover_rate: number;
+  volume_ratio: number;
+  amplitude: number;
+}
+
+export interface SelectionRecord {
+  date: string;
+  stocks: SelectionEntry[];
+}
+
 export interface BacktestResult {
   params: BacktestParams;
   metrics: PerformanceMetrics;
   nav_series: NavPoint[];
   current_holdings: HoldingStock[];
   trade_records: TradeRecord[];
+  selection_log: SelectionRecord[];
 }
 
 // ── API 调用 ──
@@ -130,7 +147,8 @@ export async function getCacheInfo(): Promise<CacheInfo> {
 
 // ── 今日选股 ──
 
-export interface TodaySelectParams {
+export interface SelectParams {
+  trade_date?: string;         // YYYY-MM-DD, undefined = today
   max_float_mktcap?: number;
   min_turnover_rate?: number;
   min_volume_ratio?: number;
@@ -139,7 +157,49 @@ export interface TodaySelectParams {
   max_positions?: number;
 }
 
-export async function getTodayHoldings(params: TodaySelectParams): Promise<HoldingStock[]> {
-  const res = await api.get<HoldingStock[]>("/api/v1/portfolio/today", { params });
+export interface DateRangeInfo {
+  start: string | null;
+  end: string | null;
+  tushare_configured: boolean;
+  error?: string;
+}
+
+export async function selectStocks(params: SelectParams): Promise<HoldingStock[]> {
+  const res = await api.get<HoldingStock[]>("/api/v1/portfolio/select", { params });
+  return res.data;
+}
+
+export async function getAvailableDateRange(): Promise<DateRangeInfo> {
+  const res = await api.get<DateRangeInfo>("/api/v1/portfolio/available-date-range");
+  return res.data;
+}
+
+// backward compat
+export type TodaySelectParams = SelectParams;
+export async function getTodayHoldings(params: SelectParams): Promise<HoldingStock[]> {
+  return selectStocks(params);
+}
+
+// ── 分时图 ──
+
+export interface MinuteBar {
+  dt: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  vol: number;
+}
+
+export interface MinuteChartData {
+  code: string;
+  name: string;
+  trade_date: string;
+  date_range: { start: string; end: string };
+  bars: MinuteBar[];
+}
+
+export async function getMinuteChart(code: string, date: string): Promise<MinuteChartData> {
+  const res = await api.get<MinuteChartData>("/api/v1/chart/minute", { params: { code, date } });
   return res.data;
 }

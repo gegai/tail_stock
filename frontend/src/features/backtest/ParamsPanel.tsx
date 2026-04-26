@@ -28,6 +28,7 @@ export function ParamsPanel({ onRun, loading }: Props) {
       limitup_lookback: values.limitup_lookback as number,
       max_positions: values.max_positions as number,
       frequency: values.frequency as BacktestParams["frequency"],
+      buy_timing: values.buy_timing as BacktestParams["buy_timing"],
       initial_capital: values.initial_capital as number,
       commission_rate: (values.commission_rate as number) / 10000,
     };
@@ -48,16 +49,17 @@ export function ParamsPanel({ onRun, loading }: Props) {
         size="small"
         initialValues={{
           start_date: dayjs("2020-01-01"),
-          end_date: dayjs("2024-12-31"),
+          end_date: dayjs("2026-04-24"),
           max_float_mktcap: 200,
           min_turnover_rate: 3,
           min_volume_ratio: 1.2,
           max_amplitude: 5,
           limitup_lookback: 20,
-          max_positions: 5,
-          frequency: "weekly",
+          max_positions: 1,
+          frequency: "daily",
+          buy_timing: "t1_open",
           initial_capital: 100_000,
-          commission_rate: 15,
+          commission_rate: 5,
         }}
       >
         {/* 时间区间 */}
@@ -127,9 +129,20 @@ export function ParamsPanel({ onRun, loading }: Props) {
         {/* 换仓频率 */}
         <Form.Item label="换仓频率" name="frequency">
           <Select options={[
-            { label: "每日换仓", value: "daily" },
+            { label: "每日换仓（隔日卖出）", value: "daily" },
             { label: "每周换仓", value: "weekly" },
             { label: "每月换仓", value: "monthly" },
+          ]} />
+        </Form.Item>
+
+        {/* 买入时机 */}
+        <Form.Item
+          label={<span>买入时机{tip("t_close：T日收盘价入场（近似14:30尾盘）；t1_open：T+1日09:30开盘价买入")}</span>}
+          name="buy_timing"
+        >
+          <Select options={[
+            { label: "T+1日开盘 09:30", value: "t1_open" },
+            { label: "T日尾盘 14:30（收盘价）", value: "t_close" },
           ]} />
         </Form.Item>
 

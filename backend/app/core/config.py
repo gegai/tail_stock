@@ -15,6 +15,8 @@ class Settings(BaseSettings):
 
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
+    tushare_token: str = ""   # 用于获取当天实时数据（历史数据走 parquet）
+
     risk_free_rate: float = 0.03
     default_commission: float = 0.0015
 

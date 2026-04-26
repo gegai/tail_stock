@@ -5,6 +5,7 @@ import { StatsCards } from "./StatsCards";
 import { NavChart } from "./NavChart";
 import { DrawdownChart } from "./DrawdownChart";
 import { TradeTable } from "./TradeTable";
+import { SelectionLog } from "./SelectionLog";
 import { HoldingsTable } from "../portfolio/HoldingsTable";
 import { TodayPage } from "../portfolio/TodayPage";
 import { DataPanel } from "../data/DataPanel";
@@ -53,7 +54,7 @@ function BacktestTab({ dataReady }: { dataReady: boolean }) {
               <div style={{ textAlign: "center", padding: "40px 0" }}>
                 <Spin size="large" />
                 <div style={{ marginTop: 16, color: "#8c8c8c" }}>
-                  回测运行中（数据已缓存，通常 10-30 秒）...
+                  回测运行中，首次约 10-30 秒；相同参数会命中缓存秒级返回...
                 </div>
               </div>
             </Card>
@@ -88,7 +89,8 @@ function BacktestTab({ dataReady }: { dataReady: boolean }) {
               >
                 <HoldingsTable holdings={result.current_holdings} />
               </Card>
-              <TradeTable records={result.trade_records} />
+              <TradeTable records={result.trade_records ?? []} />
+              <SelectionLog records={result.selection_log ?? []} />
             </>
           )}
         </Space>
