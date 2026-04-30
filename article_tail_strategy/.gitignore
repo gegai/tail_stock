@@ -1,0 +1,6 @@
+/backend/build/
+/backend/dist/
+/backend/tail-strategy-backend.spec
+/desktop/dist/
+/desktop/node_modules/
+/desktop/resources/

@@ -29,10 +29,15 @@ import {
   BacktestRecordSummary,
   BacktestResponse,
   DataInfo,
+  OptimizationProgress,
+  OptimizationRecordSummary,
+  OptimizationResultItem,
   RuleResult,
   SelectedStock,
   StockWindowResponse,
   StrategyParams,
+  TradeRecord,
+  cancelOptimization,
   deleteBacktestRecord,
   getBacktestRecord,
   getBacktestProgress,
@@ -40,9 +45,13 @@ import {
   getDataInfo,
   getMinute,
   getMinuteDetail,
+  getOptimizationProgress,
+  getOptimizationRecords,
   getStockWindow,
+  resumeOptimization,
   runSelection,
-  startBacktest
+  startBacktest,
+  startOptimization
 } from "./api";
 import "./style.css";
 
@@ -58,8 +67,8 @@ const defaultStrategy: StrategyParams = {
   require_market_up: true,
   require_intraday_checks: true,
   require_index_above_ma20: true,
-  min_market_tail_return_pct: 0.15,
-  min_tail_return_pct: 0.3,
+  min_market_tail_return_pct: 0.05,
+  min_tail_return_pct: 0.2,
   min_close_vs_vwap_pct: 0.1,
   max_morning_vwap_band_pct: 1,
   tail_volume_multiplier: 1,
@@ -69,7 +78,139 @@ const defaultStrategy: StrategyParams = {
 };
 
 function pct(v: number) {
+  if (!Number.isFinite(v)) return "-";
   return `${(v * 100).toFixed(2)}%`;
+}
+
+function annualizedFromRecord(record: BacktestRecordSummary) {
+  if (Number.isFinite(record.annualized_return)) return record.annualized_return;
+  const start = dayjs(record.start_date);
+  const end = dayjs(record.end_date);
+  const days = end.diff(start, "day");
+  if (!Number.isFinite(record.total_return) || days <= 0) return Number.NaN;
+  return Math.pow(1 + record.total_return, 365 / days) - 1;
+}
+
+const exitReasonLabels: Record<string, string> = {
+  take_profit: "止盈",
+  stop_loss: "止损",
+  max_loss: "单笔最大亏损",
+  market_tail_weak: "大盘尾盘走弱",
+  trend_broken: "趋势走坏",
+  close: "到期卖出",
+  no_next_day: "无下一交易日"
+};
+
+function exitReasonText(reason: string) {
+  return exitReasonLabels[reason] ?? reason;
+}
+
+function optimizationStatusText(status: OptimizationRecordSummary["status"]) {
+  const labels: Record<OptimizationRecordSummary["status"], string> = {
+    queued: "排队中",
+    running: "运行中",
+    done: "完成",
+    error: "失败",
+    cancelled: "已取消"
+  };
+  return labels[status];
+}
+
+function parseNumberList(value: unknown, fallback: number[]) {
+  const parsed = String(value ?? "")
+    .split(/[,，\s]+/)
+    .map((item) => Number(item.trim()))
+    .filter((item) => Number.isFinite(item));
+  return parsed.length ? parsed : fallback;
+}
+
+function formatParamSummary(params: Record<string, unknown>) {
+  const labels: Record<string, string> = {
+    max_float_mktcap: "市值",
+    max_amplitude: "振幅",
+    max_volume_ratio: "量比上限",
+    min_market_tail_return_pct: "大盘尾盘",
+    min_tail_return_pct: "个股尾盘",
+    take_profit_pct: "止盈",
+    stop_loss_pct: "止损",
+    max_positions: "持仓"
+  };
+  return Object.entries(labels)
+    .filter(([key]) => params[key] !== undefined)
+    .map(([key, label]) => `${label}:${params[key]}`)
+    .join("  ");
+}
+
+const backtestParamLabels: Array<[keyof BacktestParams, string, (value: unknown) => string]> = [
+  ["start_date", "开始", String],
+  ["end_date", "结束", String],
+  ["initial_capital", "初始资金", (v) => Number(v).toLocaleString()],
+  ["max_position_pct", "单股仓位", (v) => pct(Number(v))],
+  ["max_float_mktcap", "流通市值上限", (v) => `${v} 亿`],
+  ["min_turnover_rate", "换手率下限", (v) => `${v}%`],
+  ["min_volume_ratio", "量比下限", String],
+  ["max_volume_ratio", "量比上限", String],
+  ["max_amplitude", "振幅上限", (v) => `${v}%`],
+  ["limitup_lookback", "涨停回看", (v) => `${v} 日`],
+  ["min_market_tail_return_pct", "大盘尾盘涨幅", (v) => `${v}%`],
+  ["min_tail_return_pct", "个股尾盘涨幅", (v) => `${v}%`],
+  ["min_close_vs_vwap_pct", "收盘高于均价", (v) => `${v}%`],
+  ["max_morning_vwap_band_pct", "均价线震荡", (v) => `${v}%`],
+  ["tail_volume_multiplier", "尾盘放量倍数", String],
+  ["max_recent_amplitude_pct", "近期振幅上限", (v) => `${v}%`],
+  ["recent_amplitude_lookback", "近期振幅回看", (v) => `${v} 日`],
+  ["take_profit_pct", "止盈", (v) => `${v}%`],
+  ["stop_loss_pct", "止损", (v) => `${v}%`],
+  ["max_trade_loss_pct", "单笔最大亏损", (v) => `${v}%`],
+  ["market_tail_weak_pct", "大盘尾盘走弱", (v) => `${v}%`],
+  ["trend_break_ma_window", "趋势均线", (v) => `${v} 日`],
+  ["trend_exit_after_days", "趋势启用日", (v) => `${v} 日`],
+  ["max_hold_days", "最大持有天数", (v) => `${v} 日`],
+  ["max_positions", "最大持仓数", String],
+  ["enable_trend_exit", "趋势走坏卖出", (v) => (v ? "开启" : "关闭")],
+  ["require_index_above_ma20", "大盘 MA20 过滤", (v) => (v ? "开启" : "关闭")],
+  ["commission_rate", "手续费", (v) => `${(Number(v) * 10000).toFixed(2)} BP`]
+];
+
+function BacktestParamDetails({ params }: { params: BacktestParams }) {
+  return (
+    <Descriptions bordered size="small" column={4}>
+      {backtestParamLabels.map(([key, label, format]) => (
+        <Descriptions.Item key={key} label={label}>
+          {format(params[key])}
+        </Descriptions.Item>
+      ))}
+    </Descriptions>
+  );
+}
+
+function backtestParamsToFormValues(params: BacktestParams) {
+  return {
+    ...params,
+    start_date: dayjs(params.start_date),
+    end_date: dayjs(params.end_date),
+    max_position_pct: params.max_position_pct * 100,
+    commission_rate: params.commission_rate * 10000
+  };
+}
+
+function buildDefaultBacktestParams(startDate: string, endDate: string): BacktestParams {
+  return {
+    ...defaultStrategy,
+    start_date: startDate,
+    end_date: endDate,
+    initial_capital: 100000,
+    max_position_pct: 0.3,
+    take_profit_pct: 5,
+    stop_loss_pct: 5,
+    max_trade_loss_pct: 5,
+    market_tail_weak_pct: -0.3,
+    trend_break_ma_window: 5,
+    trend_exit_after_days: 3,
+    max_hold_days: 5,
+    enable_trend_exit: true,
+    commission_rate: 0.001
+  };
 }
 
 function stockDetailUrl(code: string, name: string, centerDate: string) {
@@ -213,33 +354,46 @@ function DataPanel() {
 function StrategyForm({
   onFinish,
   backtest = false,
-  loading = false
+  loading = false,
+  initialBacktestParams = null
 }: {
   onFinish: (values: Record<string, unknown>) => void;
   backtest?: boolean;
   loading?: boolean;
+  initialBacktestParams?: BacktestParams | null;
 }) {
+  const [form] = Form.useForm();
+  const initialValues = {
+    ...defaultStrategy,
+    trade_date: dayjs("2026-04-24"),
+    start_date: dayjs("2025-01-01"),
+    end_date: dayjs("2026-04-24"),
+    initial_capital: 100000,
+    max_position_pct: 30,
+    take_profit_pct: 5,
+    stop_loss_pct: 5,
+    max_trade_loss_pct: 5,
+    market_tail_weak_pct: -0.3,
+    trend_break_ma_window: 5,
+    trend_exit_after_days: 3,
+    max_hold_days: 5,
+    enable_trend_exit: true,
+    commission_rate: 10,
+    ...(backtest && initialBacktestParams ? backtestParamsToFormValues(initialBacktestParams) : {})
+  };
+
+  useEffect(() => {
+    if (backtest && initialBacktestParams) {
+      form.setFieldsValue(backtestParamsToFormValues(initialBacktestParams));
+    }
+  }, [backtest, form, initialBacktestParams]);
+
   return (
     <Form
+      form={form}
       layout="vertical"
       size="small"
-      initialValues={{
-        ...defaultStrategy,
-        trade_date: dayjs("2026-04-24"),
-        start_date: dayjs("2026-04-01"),
-        end_date: dayjs("2026-04-24"),
-        initial_capital: 100000,
-        max_position_pct: 30,
-        take_profit_pct: 5,
-        stop_loss_pct: 5,
-        max_trade_loss_pct: 5,
-        market_tail_weak_pct: -0.3,
-        trend_break_ma_window: 5,
-        trend_exit_after_days: 3,
-        max_hold_days: 5,
-        enable_trend_exit: true,
-        commission_rate: 15
-      }}
+      initialValues={initialValues}
       onFinish={onFinish}
     >
       {backtest ? (
@@ -390,7 +544,7 @@ function SelectionPanel() {
   );
 }
 
-function BacktestPanel() {
+function BacktestPanel({ initialParams }: { initialParams: BacktestParams | null }) {
   const [result, setResult] = useState<BacktestResponse | null>(null);
   const [records, setRecords] = useState<BacktestRecordSummary[]>([]);
   const [progress, setProgress] = useState<BacktestProgress | null>(null);
@@ -496,7 +650,7 @@ function BacktestPanel() {
 
   return (
     <Row gutter={16}>
-      <Col span={6}><Card size="small" title="回测参数"><StrategyForm backtest onFinish={submit} loading={loading} /></Card></Col>
+      <Col span={6}><Card size="small" title="回测参数"><StrategyForm backtest onFinish={submit} loading={loading} initialBacktestParams={initialParams} /></Card></Col>
       <Col span={18}>
         <Space orientation="vertical" style={{ width: "100%" }}>
           {error && <Alert type="error" message={error} />}
@@ -516,6 +670,7 @@ function BacktestPanel() {
                 { title: "时间", dataIndex: "created_at" },
                 { title: "区间", render: (_, r) => `${r.start_date} ~ ${r.end_date}` },
                 { title: "总收益", render: (_, r) => pct(r.total_return) },
+                { title: "年化", render: (_, r) => pct(annualizedFromRecord(r)) },
                 { title: "最大回撤", render: (_, r) => pct(r.max_drawdown) },
                 { title: "胜率", render: (_, r) => pct(r.win_rate) },
                 { title: "交易数", dataIndex: "trade_count" },
@@ -541,17 +696,21 @@ function BacktestPanel() {
           {result && (
             <>
               <Row gutter={8}>
-                <Col span={6}><Card><Text>总收益</Text><Title level={4}>{pct(result.metrics.total_return)}</Title></Card></Col>
-                <Col span={6}><Card><Text>最大回撤</Text><Title level={4}>{pct(result.metrics.max_drawdown)}</Title></Card></Col>
-                <Col span={6}><Card><Text>胜率</Text><Title level={4}>{pct(result.metrics.win_rate)}</Title></Card></Col>
-                <Col span={6}><Card><Text>交易数</Text><Title level={4}>{result.metrics.trade_count}</Title></Card></Col>
+                <Col span={4}><Card><Text>总收益</Text><Title level={4}>{pct(result.metrics.total_return)}</Title></Card></Col>
+                <Col span={4}><Card><Text>年化</Text><Title level={4}>{pct(result.metrics.annualized_return)}</Title></Card></Col>
+                <Col span={4}><Card><Text>最大回撤</Text><Title level={4}>{pct(result.metrics.max_drawdown)}</Title></Card></Col>
+                <Col span={4}><Card><Text>胜率</Text><Title level={4}>{pct(result.metrics.win_rate)}</Title></Card></Col>
+                <Col span={4}><Card><Text>交易数</Text><Title level={4}>{result.metrics.trade_count}</Title></Card></Col>
               </Row>
+              <Card size="small" title="参数详情">
+                <BacktestParamDetails params={result.params} />
+              </Card>
               {navOption && <Card size="small" title="净值曲线"><ReactECharts option={navOption} style={{ height: 320 }} /></Card>}
               <Card size="small" title="交易明细">
-                <Table size="small" rowKey={(r) => `${r.code}-${r.buy_date}-${r.buy_time}`} dataSource={result.trades} columns={[
-                  { title: "买入日", dataIndex: "buy_date" },
+                <Table<TradeRecord> size="small" rowKey={(r) => `${r.code}-${r.buy_date}-${r.buy_time}`} dataSource={result.trades} columns={[
+                  { title: "买入日", dataIndex: "buy_date", sorter: (a, b) => a.buy_date.localeCompare(b.buy_date) },
                   { title: "买入时间", dataIndex: "buy_time" },
-                  { title: "卖出日", dataIndex: "sell_date" },
+                  { title: "卖出日", dataIndex: "sell_date", sorter: (a, b) => a.sell_date.localeCompare(b.sell_date) },
                   { title: "卖出时间", dataIndex: "sell_time" },
                   {
                     title: "代码",
@@ -567,7 +726,7 @@ function BacktestPanel() {
                   { title: "卖价", dataIndex: "sell_price" },
                   { title: "收益率%", dataIndex: "return_pct" },
                   { title: "利润", dataIndex: "profit" },
-                  { title: "退出", dataIndex: "exit_reason" }
+                  { title: "退出", dataIndex: "exit_reason", render: (reason: string) => exitReasonText(reason) }
                 ]} />
               </Card>
             </>
@@ -620,19 +779,293 @@ function StockDetailPage() {
   );
 }
 
+function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: BacktestParams) => void }) {
+  const [progress, setProgress] = useState<OptimizationProgress | null>(null);
+  const [records, setRecords] = useState<OptimizationRecordSummary[]>([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function refreshOptimizationRecords() {
+    try {
+      setRecords(await getOptimizationRecords());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "读取参数优化记录失败");
+    }
+  }
+
+  useEffect(() => {
+    refreshOptimizationRecords();
+  }, []);
+
+  function watchOptimization(jobId: string) {
+    setLoading(true);
+    const timer = window.setInterval(async () => {
+      try {
+        const p = await getOptimizationProgress(jobId);
+        setProgress(p);
+        if (["done", "error", "cancelled"].includes(p.status)) {
+          window.clearInterval(timer);
+          setLoading(false);
+          refreshOptimizationRecords();
+          if (p.status === "error") {
+            setError(p.error || "参数优化失败");
+          }
+        }
+      } catch (e) {
+        window.clearInterval(timer);
+        setError(e instanceof Error ? e.message : "读取优化进度失败");
+        setLoading(false);
+        refreshOptimizationRecords();
+      }
+    }, 1000);
+  }
+
+  async function continueOptimization(recordId: string) {
+    setError("");
+    try {
+      const { job_id } = await resumeOptimization(recordId);
+      const p = await getOptimizationProgress(job_id);
+      setProgress(p);
+      if (!["done", "error", "cancelled"].includes(p.status)) {
+        watchOptimization(job_id);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "继续参数优化失败");
+    }
+  }
+
+  async function viewOptimization(recordId: string) {
+    setError("");
+    try {
+      setProgress(await getOptimizationProgress(recordId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "读取参数优化记录失败");
+    }
+  }
+
+  async function submit(values: Record<string, unknown>) {
+    setError("");
+    setProgress(null);
+    setLoading(true);
+
+    const startDate = (values.start_date as Dayjs).format("YYYY-MM-DD");
+    const endDate = (values.end_date as Dayjs).format("YYYY-MM-DD");
+    const baseParams: BacktestParams = {
+      ...buildDefaultBacktestParams(startDate, endDate),
+      initial_capital: Number(values.initial_capital),
+      max_position_pct: Number(values.max_position_pct) / 100,
+      max_trade_loss_pct: Number(values.max_trade_loss_pct),
+      market_tail_weak_pct: Number(values.market_tail_weak_pct),
+      trend_break_ma_window: Number(values.trend_break_ma_window),
+      trend_exit_after_days: Number(values.trend_exit_after_days),
+      max_hold_days: Number(values.max_hold_days),
+      commission_rate: Number(values.commission_rate) / 10000
+    };
+
+    const ranges = [
+      { name: "max_float_mktcap", values: parseNumberList(values.max_float_mktcap_values, [80, 120, 200]) },
+      { name: "max_amplitude", values: parseNumberList(values.max_amplitude_values, [4, 4.5, 5, 6]) },
+      { name: "max_volume_ratio", values: parseNumberList(values.max_volume_ratio_values, [1.3, 1.5, 1.8, 2.0]) },
+      { name: "min_market_tail_return_pct", values: parseNumberList(values.min_market_tail_return_pct_values, [0, 0.05, 0.1]) },
+      { name: "min_tail_return_pct", values: parseNumberList(values.min_tail_return_pct_values, [0.1, 0.2, 0.3]) },
+      { name: "take_profit_pct", values: parseNumberList(values.take_profit_pct_values, [4, 5, 6, 8]) },
+      { name: "stop_loss_pct", values: parseNumberList(values.stop_loss_pct_values, [4, 5, 6]) },
+      { name: "max_positions", values: parseNumberList(values.max_positions_values, [2, 3, 4]) }
+    ];
+
+    try {
+      const { job_id } = await startOptimization({
+        base_params: baseParams,
+        ranges,
+        max_workers: Number(values.max_workers),
+        max_combinations: Number(values.max_combinations),
+        min_trade_count: Number(values.min_trade_count),
+        max_drawdown_limit: Number(values.max_drawdown_limit) / 100,
+        top_n: Number(values.top_n)
+      });
+      setProgress({ job_id, status: "queued", percent: 0, completed: 0, total: 0, stage: "排队中", best: [], error: null });
+      refreshOptimizationRecords();
+      watchOptimization(job_id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "启动参数优化失败");
+      setLoading(false);
+    }
+  }
+
+  async function cancelCurrentJob() {
+    if (!progress) return;
+    try {
+      await cancelOptimization(progress.job_id);
+      setProgress({ ...progress, stage: "取消中" });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "取消优化任务失败");
+    }
+  }
+
+  return (
+    <Row gutter={16}>
+      <Col span={7}>
+        <Card size="small" title="参数范围">
+          <Form
+            layout="vertical"
+            size="small"
+            initialValues={{
+              start_date: dayjs("2025-01-01"),
+              end_date: dayjs("2026-04-24"),
+              initial_capital: 100000,
+              max_position_pct: 30,
+              max_trade_loss_pct: 5,
+              market_tail_weak_pct: -0.3,
+              trend_break_ma_window: 5,
+              trend_exit_after_days: 3,
+              max_hold_days: 5,
+              commission_rate: 10,
+              max_float_mktcap_values: "80,120,200",
+              max_amplitude_values: "4,4.5,5,6",
+              max_volume_ratio_values: "1.3,1.5,1.8,2.0",
+              min_market_tail_return_pct_values: "0,0.05,0.1",
+              min_tail_return_pct_values: "0.1,0.2,0.3",
+              take_profit_pct_values: "4,5,6,8",
+              stop_loss_pct_values: "4,5,6",
+              max_positions_values: "2,3,4",
+              max_workers: 10,
+              max_combinations: 6000,
+              min_trade_count: 80,
+              max_drawdown_limit: -20,
+              top_n: 20
+            }}
+            onFinish={submit}
+          >
+            <Row gutter={8}>
+              <Col span={12}><Form.Item label="开始" name="start_date"><DatePicker /></Form.Item></Col>
+              <Col span={12}><Form.Item label="结束" name="end_date"><DatePicker /></Form.Item></Col>
+              <Col span={12}><Form.Item label="初始资金" name="initial_capital"><InputNumber min={10000} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="单股仓位(%)" name="max_position_pct"><InputNumber min={1} max={100} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="最大亏损(%)" name="max_trade_loss_pct"><InputNumber min={0} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="大盘尾盘走弱(%)" name="market_tail_weak_pct"><InputNumber max={0} step={0.1} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="趋势均线" name="trend_break_ma_window"><InputNumber min={2} max={20} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="趋势启用日" name="trend_exit_after_days"><InputNumber min={1} max={20} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="最大持有天数" name="max_hold_days"><InputNumber min={1} max={20} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="手续费(BP)" name="commission_rate"><InputNumber min={0} /></Form.Item></Col>
+            </Row>
+            <Form.Item label="流通市值上限(亿元)" name="max_float_mktcap_values"><Input /></Form.Item>
+            <Form.Item label="日内振幅上限(%)" name="max_amplitude_values"><Input /></Form.Item>
+            <Form.Item label="量比上限" name="max_volume_ratio_values"><Input /></Form.Item>
+            <Form.Item label="大盘尾盘涨幅下限(%)" name="min_market_tail_return_pct_values"><Input /></Form.Item>
+            <Form.Item label="个股尾盘涨幅下限(%)" name="min_tail_return_pct_values"><Input /></Form.Item>
+            <Form.Item label="止盈(%)" name="take_profit_pct_values"><Input /></Form.Item>
+            <Form.Item label="止损(%)" name="stop_loss_pct_values"><Input /></Form.Item>
+            <Form.Item label="最大持仓数" name="max_positions_values"><Input /></Form.Item>
+            <Row gutter={8}>
+              <Col span={12}><Form.Item label="并行进程" name="max_workers"><InputNumber min={1} max={12} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="组合上限" name="max_combinations"><InputNumber min={1} max={10000} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="交易数目标" name="min_trade_count"><InputNumber min={0} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="回撤红线(%)" name="max_drawdown_limit"><InputNumber max={0} /></Form.Item></Col>
+              <Col span={12}><Form.Item label="展示前N名" name="top_n"><InputNumber min={1} max={100} /></Form.Item></Col>
+            </Row>
+            <Space>
+              <Button type="primary" htmlType="submit" loading={loading} disabled={loading}>开始优化</Button>
+              <Button onClick={cancelCurrentJob} disabled={!loading || !progress}>取消任务</Button>
+            </Space>
+          </Form>
+        </Card>
+      </Col>
+      <Col span={17}>
+        <Space orientation="vertical" style={{ width: "100%" }}>
+          {error && <Alert type="error" message={error} />}
+          <Card size="small" title="优化记录">
+            <Table<OptimizationRecordSummary>
+              size="small"
+              rowKey="id"
+              dataSource={records}
+              pagination={{ pageSize: 5 }}
+              columns={[
+                { title: "更新时间", dataIndex: "updated_at" },
+                { title: "区间", render: (_, r) => `${r.start_date} ~ ${r.end_date}` },
+                { title: "状态", render: (_, r) => optimizationStatusText(r.status) },
+                { title: "进度", render: (_, r) => `${r.completed}/${r.total || "-"}` },
+                { title: "最佳评分", render: (_, r) => r.best_score?.toFixed(4) ?? "-" },
+                { title: "最佳总收益", render: (_, r) => r.best_total_return == null ? "-" : pct(r.best_total_return) },
+                { title: "最佳年化", render: (_, r) => r.best_annualized_return == null ? "-" : pct(r.best_annualized_return) },
+                {
+                  title: "操作",
+                  render: (_, r) => (
+                    <Space>
+                      <Button size="small" onClick={() => viewOptimization(r.id)}>
+                        查看
+                      </Button>
+                      <Button size="small" onClick={() => continueOptimization(r.id)} disabled={loading || r.status === "done"}>
+                        继续
+                      </Button>
+                    </Space>
+                  )
+                }
+              ]}
+            />
+          </Card>
+          {progress && (
+            <Card size="small" title="优化进度">
+              <Progress percent={progress.percent} status={progress.status === "error" ? "exception" : progress.status === "done" ? "success" : "active"} />
+              <Text type="secondary">{progress.stage} {progress.total ? `${progress.completed}/${progress.total}` : ""}</Text>
+            </Card>
+          )}
+          <Card size="small" title="当前最优组合">
+            <Table<OptimizationResultItem>
+              size="small"
+              rowKey={(_, index) => String(index)}
+              dataSource={progress?.best || []}
+              pagination={{ pageSize: 10 }}
+              columns={[
+                { title: "评分", dataIndex: "score", sorter: (a, b) => a.score - b.score },
+                { title: "总收益", render: (_, r) => pct(r.total_return), sorter: (a, b) => a.total_return - b.total_return },
+                { title: "年化", render: (_, r) => pct(r.annualized_return) },
+                { title: "最大回撤", render: (_, r) => pct(r.max_drawdown), sorter: (a, b) => a.max_drawdown - b.max_drawdown },
+                { title: "胜率", render: (_, r) => pct(r.win_rate) },
+                { title: "交易数", dataIndex: "trade_count", sorter: (a, b) => a.trade_count - b.trade_count },
+                { title: "参数", render: (_, r) => formatParamSummary(r.params) },
+                {
+                  title: "年度",
+                  render: (_, r) => Object.entries(r.yearly_returns).map(([year, value]) => `${year}:${pct(value)}`).join("  ")
+                },
+                {
+                  title: "操作",
+                  render: (_, r) => (
+                    <Button size="small" onClick={() => onBacktestParams(r.params as unknown as BacktestParams)}>
+                      回测
+                    </Button>
+                  )
+                }
+              ]}
+            />
+          </Card>
+        </Space>
+      </Col>
+    </Row>
+  );
+}
+
 function App() {
+  const [activeTab, setActiveTab] = useState("data");
+  const [backtestInitialParams, setBacktestInitialParams] = useState<BacktestParams | null>(null);
+
   if (window.location.pathname === "/stock-detail") {
     return <StockDetailPage />;
+  }
+
+  function openBacktestWithParams(params: BacktestParams) {
+    setBacktestInitialParams(params);
+    setActiveTab("backtest");
   }
 
   return (
     <main>
       <Title level={3}>文章版尾盘30分钟选股法</Title>
       <Text type="secondary">按原文拆成大盘过滤、日线五条件、尾盘分时确认、次日多条件卖出，并逐条展示规则。</Text>
-      <Tabs items={[
+      <Tabs activeKey={activeTab} onChange={setActiveTab} items={[
         { key: "data", label: "数据查看", children: <DataPanel /> },
         { key: "select", label: "选股", children: <SelectionPanel /> },
-        { key: "backtest", label: "回测", children: <BacktestPanel /> }
+        { key: "backtest", label: "回测", children: <BacktestPanel initialParams={backtestInitialParams} /> },
+        { key: "optimize", label: "参数优化", children: <OptimizationPanel onBacktestParams={openBacktestWithParams} /> }
       ]} />
     </main>
   );

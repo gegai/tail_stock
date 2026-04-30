@@ -25,6 +25,12 @@ def test_backtest_progress_unknown_job():
     assert res.status_code == 404
 
 
+def test_optimization_progress_unknown_job():
+    client = TestClient(app)
+    res = client.get("/api/optimize/progress/not-a-job")
+    assert res.status_code == 404
+
+
 def test_minute_detail_stock_uses_one_minute_data():
     client = TestClient(app)
     res = client.get("/api/minute/detail", params={

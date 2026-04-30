@@ -19,30 +19,34 @@ from app.services.data import (
 
 
 def rule(name: str, passed: bool, actual=None, threshold: str | None = None, note: str = "") -> RuleResult:
+    """创建一条可展示的规则结果。
+
+    所有选股条件都用 RuleResult 返回给前端，用户可以看到每条规则是否通过、
+    实际值是多少、阈值是多少，而不是只得到一个黑盒选股列表。
+    """
     if isinstance(actual, (float, np.floating)) and math.isfinite(float(actual)):
         actual = round(float(actual), 4)
     return RuleResult(name=name, passed=bool(passed), actual=actual, threshold=threshold, note=note)
 
 
 def _time_part(series: pd.Series) -> pd.Series:
+    """把分钟线时间转换成 HH:MM 字符串，便于筛选 14:30 后数据。"""
     return pd.to_datetime(series).dt.strftime("%H:%M")
 
 
 def market_tail_rules(day: str | pd.Timestamp, params: StrategyParams) -> list[RuleResult]:
-    """Translate the article's market condition into two machine rules.
+    """把文章里的大盘条件转换成可复现的机器规则。
 
-    The article says to check the market after 14:30 and avoid entering when the
-    index is weak or dumping on volume. We implement that as:
+    文章要求 14:30 后观察大盘，弱势或放量下跌时不进场。这里拆成两类判断：
 
-    - 沪深300 14:30-to-close close return must be positive.
-    - 放量大跌 means three conditions happen together: full-day return <= -1.5%,
-      14:30-to-close return <= -0.3%, and tail-session volume is at least 1.5x
-      the earlier intraday average volume.
+    - 沪深300 14:30 到收盘的涨幅必须达到参数要求。
+    - 放量大跌必须同时满足三项：全天跌幅不小、尾盘继续下跌、尾盘量能明显放大。
     """
     df = load_index_minutes(settings.benchmark_code, day, "15min")
     if df.empty:
         return [rule("大盘15分钟数据可用", False, "missing", note="未找到沪深30015分钟数据")]
 
+    # 文章强调“14:30 后大盘不能走弱”，所以这里单独切出尾盘区间。
     times = _time_part(df["trade_time"])
     tail = df[times >= "14:30"].copy()
     if len(tail) < 2:
@@ -60,13 +64,13 @@ def market_tail_rules(day: str | pd.Timestamp, params: StrategyParams) -> list[R
     pre_tail_avg_vol = float(pre_tail["vol"].mean()) if not pre_tail.empty else 0.0
     tail_avg_vol = float(tail["vol"].mean())
     tail_vol_ratio = tail_avg_vol / pre_tail_avg_vol if pre_tail_avg_vol else 0.0
+    # “放量大跌”使用用户确认过的三条件定义：
+    # 当日跌幅 <= -1.5%，且 14:30 后继续跌 <= -0.3%，且尾盘量能 >= 前面均量 1.5 倍。
     crash = day_ret <= -1.5 and tail_ret <= -0.3 and tail_vol_ratio >= 1.5
     index_trend_rule = _index_ma20_rule(day, params)
 
-    # The first versions accepted any positive tail return. Backtest review
-    # showed that many "barely red-to-green" index tails still led to weak
-    # next-day trades, so this quality version requires a configurable minimum
-    # tail-session index gain before allowing new positions.
+    # 早期版本只要求尾盘涨幅大于 0。复盘后发现很多“勉强翻红”的大盘尾盘，
+    # 次日个股表现仍然偏弱，所以这里改成可配置的最低尾盘涨幅门槛。
     rules = [
         rule(
             "大盘14:30后15分钟K线有效上升",
@@ -87,12 +91,11 @@ def market_tail_rules(day: str | pd.Timestamp, params: StrategyParams) -> list[R
 
 
 def _index_ma20_rule(day: str | pd.Timestamp, params: StrategyParams) -> RuleResult | None:
-    """Require the benchmark to close above MA20 before buying.
+    """要求基准指数收盘站上 20 日均线后才允许买入。
 
-    The recent record review showed that buying when HS300 was below MA20 had
-    much worse win rate and PnL. This is a market-regime gate, separate from
-    the 14:30 tail rule: the tail can bounce while the broader index trend is
-    still unhealthy.
+    复盘发现沪深300低于 MA20 时买入，胜率和盈亏表现明显更差。
+    这是一道市场状态过滤，和 14:30 后尾盘规则互相独立：
+    大盘尾盘可以反弹，但更大级别趋势仍可能不健康。
     """
     if not params.require_index_above_ma20:
         return None
@@ -109,27 +112,29 @@ def _index_ma20_rule(day: str | pd.Timestamp, params: StrategyParams) -> RuleRes
 
 
 def daily_screen(day: str | pd.Timestamp, params: StrategyParams) -> tuple[pd.DataFrame, int]:
-    """Apply the article's five objective daily filters.
+    """执行文章中客观可量化的日线过滤条件。
 
-    This function deliberately keeps only rules that can be known at the T-day
-    close: daily amplitude, current-day circulating market cap, turnover,
-    volume ratio, and recent limit-up history.
+    这里刻意只使用 T 日收盘时已经能知道的数据：当日振幅、当日流通市值、
+    当日换手率、当日量比、近期涨停历史。这样可以避免未来函数。
     """
     raw = load_daily_date(day)
     df = enrich_daily(raw)
     if df.empty:
         return df, 0
 
+    # 基础可交易性过滤：只保留正常上市、非 ST、未停牌、上市满 60 天的股票。
+    # 这些不是文章核心条件，但属于回测必须有的现实交易约束。
     df = df[df["list_status"].fillna("L") == "L"].copy()
     df = df[~df["is_st"].fillna(False).astype(bool)]
-    # Historical is_st flags can be stale. The name guard prevents ST/*ST rows
-    # from slipping into selection when the daily flag is missing or wrong.
+    # 历史 is_st 标记可能缺失或滞后，所以再用股票名称做一层兜底过滤，
+    # 避免 ST/*ST 股票因为日线标记异常而混入候选池。
     df = df[~df["name"].fillna("").astype(str).str.upper().str.contains("ST", regex=False)]
     df = df[df["suspend_type"].fillna("N") == "N"]
     df = df[df["listed_days"].fillna(0) >= 60]
     df = df[df["close"].notna() & (df["close"] > 0)]
     base_count = len(df)
 
+    # 文章里的日线五条件在这里落地：振幅、市值、换手、量比、近期涨停记忆。
     df = df[df["amplitude"].notna() & (df["amplitude"] <= params.max_amplitude)]
     df = df[df["float_mktcap"].notna() & (df["float_mktcap"] <= params.max_float_mktcap)]
     df = df[df["turnover_rate"].notna() & (df["turnover_rate"] >= params.min_turnover_rate)]
@@ -142,30 +147,33 @@ def daily_screen(day: str | pd.Timestamp, params: StrategyParams) -> tuple[pd.Da
     start = str(lookback_days[0].date()) if lookback_days else str(pd.Timestamp(day).date())
     end = str(pd.Timestamp(day).date())
     hist = load_daily_range(start, end, ["pct_chg"])
+    # 涨停历史用“当日涨跌幅不低于 9.9%”近似。不同股票涨跌停制度不同，
+    # 这里先用保守统一阈值表达“近期有涨停记忆”。
     limitup_codes = set(hist.loc[hist["pct_chg"] >= 9.9, "ts_code"].unique())
     df = df[df["ts_code"].isin(limitup_codes)]
     return df, base_count
 
 
 def stock_tail_metrics(code: str, day: str | pd.Timestamp, params: StrategyParams) -> tuple[list[RuleResult], dict]:
-    """Quantify the article's tail-session price/volume description.
+    """量化文章里的个股尾盘价格和成交量描述。
 
-    The article's language is discretionary: "回踩均价线不破", "分时上升",
-    "持续有大单买入". Because the data does not include order-book large-order
-    tags, large-order buying is approximated by tail-session volume expansion.
-    Each approximation is returned as a visible rule so users can audit it.
+    文章的表达偏交易经验，例如“回踩均价线不破”“分时上升”“持续有大单买入”。
+    当前数据没有逐笔大单标签，所以用尾盘成交量放大近似“大单买入”。
+    每个近似规则都会返回给前端，用户可以逐条审计。
     """
     df = load_stock_minutes(code, day, "15min")
     if df.empty:
         return [rule("个股15分钟数据可用", False, "missing")], {}
 
     times = _time_part(df["trade_time"])
+    # 用当日累计成交额除以累计成交量近似分时均价线，用于判断尾盘是否站上均价线。
     amount_cum = df["amount"].cumsum()
     vol_cum = df["vol"].replace(0, pd.NA).cumsum()
     vwap = (amount_cum / vol_cum).ffill().fillna(df["close"])
     df = df.copy()
     df["vwap"] = vwap
 
+    # 核心买点只看 14:30 之后：文章强调尾盘确认，而不是全天任意时刻追涨。
     tail = df[times >= "14:30"]
     pre_tail = df[times < "14:30"]
     morning = df[times < "14:30"]
@@ -185,9 +193,8 @@ def stock_tail_metrics(code: str, day: str | pd.Timestamp, params: StrategyParam
         dev_low = (morning["low"] / morning["vwap"] - 1).abs()
         morning_band = float(pd.concat([dev_high, dev_low], axis=1).max(axis=1).median() * 100)
 
-    # These are the core quality gates for the stock's final 30 minutes.
-    # A small positive tick is not enough: price must have a meaningful
-    # 14:30-to-close rise and finish above the intraday VWAP by a buffer.
+    # 这些是个股尾盘质量的核心门槛。只是微涨不够，必须 14:30 到收盘有
+    # 明确涨幅，并且收盘价相对当日均价线有一定缓冲。
     rules = [
         rule("个股14:30后分时有效上升", tail_ret >= params.min_tail_return_pct, tail_ret, f">= {params.min_tail_return_pct}%"),
         rule("尾盘收盘站上均价线", close_vs_vwap >= params.min_close_vs_vwap_pct, close_vs_vwap, f">= {params.min_close_vs_vwap_pct}%"),
@@ -204,11 +211,10 @@ def stock_tail_metrics(code: str, day: str | pd.Timestamp, params: StrategyParam
 
 
 def trend_rules(code: str, day: str | pd.Timestamp, params: StrategyParams) -> list[RuleResult]:
-    """Approximate the article's medium-term uptrend requirement.
+    """近似表达文章里的中期上升趋势要求。
 
-    The article prefers stocks in a clear medium-term uptrend after short-term
-    washout. We model this with close > MA20 > MA60 and a recent pullback that
-    is not already overheated.
+    文章偏好中期趋势清晰、短期经过整理但尚未过热的股票。
+    这里用 close > MA20 > MA60 表达中期趋势，用短期回调和近期振幅控制过热程度。
     """
     lookback = previous_trading_dates(day, 80)
     if len(lookback) < 60:
@@ -217,15 +223,16 @@ def trend_rules(code: str, day: str | pd.Timestamp, params: StrategyParams) -> l
     hist = hist[hist["ts_code"] == code].sort_values("trade_date")
     if len(hist) < 60:
         return [rule("中期趋势数据足够", False, len(hist), ">=60")]
+    # 中期趋势用“收盘价高于二十日均线，二十日均线高于六十日均线”表达；这不是文章原文的唯一解释，
+    # 但它把“中期上升趋势”固定成了可复现规则。
     close = hist["close"]
     ma20 = close.rolling(20).mean().iloc[-1]
     ma60 = close.rolling(60).mean().iloc[-1]
     last = close.iloc[-1]
     prev5 = close.iloc[-6:-1].max()
     pullback = (last / prev5 - 1) * 100 if prev5 else 0.0
-    # Avoid chasing stocks whose recent swings are already too wide. The
-    # strategy buys near the close and then holds overnight, so high recent
-    # amplitude usually means the stop-loss is easier to hit before take-profit.
+    # 避免追入近期波动已经过大的股票。策略在尾盘买入并隔夜持有，
+    # 如果最近振幅过大，通常更容易先触发止损而不是止盈。
     recent = hist.tail(params.recent_amplitude_lookback)
     recent_amp = ((recent["high"] - recent["low"]) / recent["pre_close"].replace(0, np.nan) * 100).mean()
     return [
@@ -236,10 +243,15 @@ def trend_rules(code: str, day: str | pd.Timestamp, params: StrategyParams) -> l
 
 
 def score_row(row: pd.Series, metrics: dict) -> float:
+    """给通过全部硬条件的股票打排序分。
+
+    硬条件决定“能不能买”，score 只决定“最多持仓数有限时优先买谁”。
+    分数偏好：换手适中、量比在 1.2~1.3 附近、市值更小、振幅更低、
+    尾盘涨幅和尾盘放量更明显。
+    """
     s_turn = min(float(row["turnover_rate"]) / 6.0, 1.0) * 25
-    # The latest history review showed that very high volume_ratio was often
-    # late-stage heat rather than clean accumulation. Score the 1.2-1.3 area
-    # highest and taper down if users relax max_volume_ratio in experiments.
+    # 最近几组历史复盘显示，过高量比经常不是干净吸筹，而是偏后排的情绪热度。
+    # 因此 1.2 到 1.3 附近给最高分；如果用户放宽量比上限，分数会逐步衰减。
     s_vr = max(1 - abs(float(row["volume_ratio"]) - 1.25) / 0.75, 0) * 20
     s_mkt = max(1 - float(row["float_mktcap"]) / 80.0, 0) * 15
     s_amp = max(1 - float(row["amplitude"]) / 4.0, 0) * 10
@@ -249,25 +261,29 @@ def score_row(row: pd.Series, metrics: dict) -> float:
 
 
 def select_for_date(day: str | pd.Timestamp, params: StrategyParams) -> SelectionResponse:
-    """Run the complete article-style selection pipeline for one day.
+    """执行某一天完整的文章版选股流程。
 
-    Pipeline order:
-    1. Market filter.
-    2. Daily five-condition pool.
-    3. Trend checks.
-    4. Tail-session intraday checks.
-    5. Score and cap to max_positions.
+    流程顺序：
+    1. 大盘环境过滤。
+    2. 日线五条件过滤。
+    3. 中期趋势检查。
+    4. 尾盘分时检查。
+    5. 打分排序，并按最大持仓数截断。
 
-    The response includes every rule result so the frontend can show exactly why
-    a stock passed or failed.
+    响应里包含每条规则的结果，前端可以展示股票为什么通过或为什么失败。
     """
     day_ts = pd.Timestamp(day).normalize()
+
+    # 第一步先判断大盘环境。大盘不过关时直接返回空选股，避免在弱市场里硬选。
     market = market_tail_rules(day_ts, params)
     market_ok = all(r.passed for r in market) if params.require_market_up else True
 
+    # 第二步做日线条件过滤，得到基础候选池。
     screened, base_count = daily_screen(day_ts, params)
     selected: list[SelectedStock] = []
     if market_ok and not screened.empty:
+        # 第三步逐只股票做趋势和尾盘分时检查。分钟数据是按股票单文件读取的，
+        # 所以只有经过日线过滤的少量候选才进入这里，避免全市场分钟数据扫描过慢。
         for _, row in screened.iterrows():
             code = str(row["ts_code"])
             rules = [
@@ -282,6 +298,8 @@ def select_for_date(day: str | pd.Timestamp, params: StrategyParams) -> Selectio
             intraday, metrics = stock_tail_metrics(code, day_ts, params)
             all_rules = rules + trend + intraday
             if (not params.require_intraday_checks or all(r.passed for r in trend + intraday)):
+                # 通过全部硬条件后才进入已选列表。这里同时保存关键指标，前端表格
+                # 就能直接展示市值、换手、量比、尾盘涨幅等复盘信息。
                 selected.append(SelectedStock(
                     code=code,
                     name=str(row.get("name", code)),
@@ -298,6 +316,7 @@ def select_for_date(day: str | pd.Timestamp, params: StrategyParams) -> Selectio
                     tail_volume_ratio=round(metrics.get("tail_volume_ratio", 0.0), 4),
                 ))
 
+    # 持仓数量有限时，按排序分从高到低取参数规定数量的股票。
     selected.sort(key=lambda x: x.score, reverse=True)
     return SelectionResponse(
         trade_date=str(day_ts.date()),

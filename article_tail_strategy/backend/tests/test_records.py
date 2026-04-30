@@ -27,6 +27,7 @@ def test_backtest_record_round_trip(tmp_path, monkeypatch):
 
     assert listed[0].id == summary.id
     assert listed[0].total_return == 0.12
+    assert listed[0].annualized_return == 1.2
     assert loaded.metrics.trade_count == 10
 
     records.delete_backtest_record(summary.id)

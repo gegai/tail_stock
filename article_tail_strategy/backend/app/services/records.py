@@ -10,14 +10,22 @@ from app.models import BacktestRecordSummary, BacktestResponse
 
 
 def records_dir() -> Path:
-    """Return the local folder used for durable backtest records."""
+    """返回本地回测记录目录，不存在时自动创建。
+
+    回测记录属于用户本机数据，不上传、不外发。Electron 打包后会写到
+    APPDATA 下的 article-tail-strategy/storage/backtest_records。
+    """
     path = settings.storage_root / "backtest_records"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def save_backtest_record(result: BacktestResponse) -> BacktestRecordSummary:
-    """Persist a full backtest response and return its compact summary."""
+    """保存完整回测结果，并返回列表页需要的摘要。
+
+    文件名里包含创建时间和随机后缀，避免同一秒多次回测产生重名。
+    JSON 使用 ensure_ascii=False，中文股票名和规则名可以直接读。
+    """
     created_at = datetime.now().isoformat(timespec="seconds")
     record_id = f"{created_at.replace(':', '').replace('-', '').replace('T', '-')}-{uuid4().hex[:8]}"
     payload = {
@@ -31,7 +39,10 @@ def save_backtest_record(result: BacktestResponse) -> BacktestRecordSummary:
 
 
 def list_backtest_records() -> list[BacktestRecordSummary]:
-    """List saved backtests, newest first."""
+    """列出本地保存的回测记录，按创建时间倒序返回。
+
+    如果遇到损坏的 JSON 文件，直接跳过，避免一个坏记录导致整个历史列表打不开。
+    """
     summaries: list[BacktestRecordSummary] = []
     for path in records_dir().glob("*.json"):
         try:
@@ -42,7 +53,7 @@ def list_backtest_records() -> list[BacktestRecordSummary]:
 
 
 def load_backtest_record(record_id: str) -> BacktestResponse:
-    """Load one saved backtest by id."""
+    """按 id 读取一条完整回测记录。"""
     path = records_dir() / f"{record_id}.json"
     if not path.exists():
         raise FileNotFoundError(record_id)
@@ -51,7 +62,7 @@ def load_backtest_record(record_id: str) -> BacktestResponse:
 
 
 def delete_backtest_record(record_id: str) -> None:
-    """Delete one saved backtest record from local storage."""
+    """删除一条本地回测记录。"""
     path = records_dir() / f"{record_id}.json"
     if not path.exists():
         raise FileNotFoundError(record_id)
@@ -59,6 +70,7 @@ def delete_backtest_record(record_id: str) -> None:
 
 
 def _summary_from_payload(payload: dict) -> BacktestRecordSummary:
+    """从完整记录数据中抽取历史列表需要的摘要字段。"""
     result = payload["result"]
     params = result["params"]
     metrics = result["metrics"]
@@ -68,6 +80,7 @@ def _summary_from_payload(payload: dict) -> BacktestRecordSummary:
         start_date=str(params["start_date"]),
         end_date=str(params["end_date"]),
         total_return=float(metrics["total_return"]),
+        annualized_return=float(metrics.get("annualized_return", 0.0)),
         max_drawdown=float(metrics["max_drawdown"]),
         win_rate=float(metrics["win_rate"]),
         trade_count=int(metrics["trade_count"]),

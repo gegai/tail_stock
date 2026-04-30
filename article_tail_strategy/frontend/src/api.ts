@@ -111,6 +111,7 @@ export interface NavPoint {
 }
 
 export interface BacktestResponse {
+  params: BacktestParams;
   metrics: {
     total_return: number;
     annualized_return: number;
@@ -130,6 +131,7 @@ export interface BacktestRecordSummary {
   start_date: string;
   end_date: string;
   total_return: number;
+  annualized_return: number;
   max_drawdown: number;
   win_rate: number;
   trade_count: number;
@@ -143,6 +145,68 @@ export interface BacktestProgress {
   current_date: string | null;
   result: BacktestResponse | null;
   error: string | null;
+}
+
+export interface SweepRange {
+  name: string;
+  values: Array<number | boolean>;
+}
+
+export interface OptimizationParams {
+  base_params: BacktestParams;
+  ranges: SweepRange[];
+  max_workers: number;
+  max_combinations: number;
+  min_trade_count: number;
+  max_drawdown_limit: number;
+  top_n: number;
+}
+
+export interface OptimizationResultItem {
+  params: Record<string, unknown>;
+  total_return: number;
+  annualized_return: number;
+  max_drawdown: number;
+  win_rate: number;
+  trade_count: number;
+  benchmark_total_return: number;
+  score: number;
+  yearly_returns: Record<string, number>;
+}
+
+export interface OptimizationProgress {
+  job_id: string;
+  status: "queued" | "running" | "done" | "error" | "cancelled";
+  percent: number;
+  completed: number;
+  total: number;
+  stage: string;
+  best: OptimizationResultItem[];
+  error: string | null;
+}
+
+export interface OptimizationRecordSummary {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  status: "queued" | "running" | "done" | "error" | "cancelled";
+  start_date: string;
+  end_date: string;
+  completed: number;
+  total: number;
+  best_score: number | null;
+  best_total_return: number | null;
+  best_annualized_return: number | null;
+  error: string | null;
+}
+
+export interface OptimizationRecord {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  request: OptimizationParams;
+  progress: OptimizationProgress;
+  results: OptimizationResultItem[];
 }
 
 export interface MinuteBar {
@@ -185,6 +249,30 @@ export async function startBacktest(params: BacktestParams) {
 
 export async function getBacktestProgress(jobId: string) {
   return (await api.get<BacktestProgress>(`/api/backtest/progress/${jobId}`)).data;
+}
+
+export async function startOptimization(params: OptimizationParams) {
+  return (await api.post<{ job_id: string }>("/api/optimize/start", params)).data;
+}
+
+export async function getOptimizationProgress(jobId: string) {
+  return (await api.get<OptimizationProgress>(`/api/optimize/progress/${jobId}`)).data;
+}
+
+export async function cancelOptimization(jobId: string) {
+  return (await api.delete<{ ok: boolean }>(`/api/optimize/${jobId}`)).data;
+}
+
+export async function getOptimizationRecords() {
+  return (await api.get<OptimizationRecordSummary[]>("/api/optimize/records")).data;
+}
+
+export async function getOptimizationRecord(recordId: string) {
+  return (await api.get<OptimizationRecord>(`/api/optimize/records/${recordId}`)).data;
+}
+
+export async function resumeOptimization(recordId: string) {
+  return (await api.post<{ job_id: string }>(`/api/optimize/records/${recordId}/resume`)).data;
 }
 
 export async function getBacktestRecords() {

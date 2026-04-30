@@ -44,8 +44,8 @@ def test_params_match_article_defaults():
     assert p.max_amplitude == 4
     assert p.limitup_lookback == 20
     assert p.require_index_above_ma20 is True
-    assert p.min_market_tail_return_pct == 0.15
-    assert p.min_tail_return_pct == 0.30
+    assert p.min_market_tail_return_pct == 0.05
+    assert p.min_tail_return_pct == 0.20
     assert p.min_close_vs_vwap_pct == 0.10
     assert p.max_recent_amplitude_pct == 7.0
     assert p.recent_amplitude_lookback == 5
@@ -369,11 +369,11 @@ def test_tail_metrics_rejects_weak_tail_bounce(monkeypatch):
             "2026-04-24 14:30", "2026-04-24 14:45", "2026-04-24 15:00",
         ]),
         "open": [10, 10, 10, 10, 10.01, 10.02],
-        "high": [10.02, 10.02, 10.02, 10.02, 10.04, 10.06],
+        "high": [10.02, 10.02, 10.02, 10.02, 10.03, 10.04],
         "low": [9.99, 9.99, 9.99, 9.99, 10.0, 10.01],
-        "close": [10, 10, 10, 10.0, 10.02, 10.03],
+        "close": [10, 10, 10, 10.0, 10.01, 10.015],
         "vol": [100, 100, 100, 200, 220, 250],
-        "amount": [1000, 1000, 1000, 2000, 2204, 2507.5],
+        "amount": [1000, 1000, 1000, 2000, 2202.2, 2503.75],
     })
     monkeypatch.setattr("app.services.strategy.load_stock_minutes", lambda code, day, freq: bars)
 

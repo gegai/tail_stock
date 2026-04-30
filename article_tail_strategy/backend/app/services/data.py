@@ -17,50 +17,73 @@ DAILY_COLS = [
 
 
 def market_dir() -> Path:
+    """股票行情数据目录，默认位于 D:/股票数据/行情数据。"""
     return settings.data_root / "行情数据"
 
 
 def index_dir() -> Path:
+    """指数行情数据目录，默认位于 D:/股票数据/指数数据。"""
     return settings.data_root / "指数数据"
 
 
 def stock_daily_path() -> Path:
+    """全市场日线列式数据文件路径。"""
     return market_dir() / "stock_daily.parquet"
 
 
 def stock_basic_path() -> Path:
+    """股票基础信息列式数据文件路径。"""
     return market_dir() / "stock_basic_data.parquet"
 
 
 def stock_minute_path(code: str, freq: str = "15min") -> Path:
+    """单只股票分钟线文件路径，频率参数支持一分钟、十五分钟等目录。"""
     return market_dir() / f"stock_{freq}" / f"{code}.parquet"
 
 
 def index_minute_path(code: str, freq: str = "15min") -> Path:
+    """指数分钟线文件路径。"""
     return index_dir() / f"index_{freq}" / f"{code}.parquet"
 
 
 def index_daily_path(code: str) -> Path:
+    """指数日线文件路径。"""
     return index_dir() / "index_daily" / f"{code}.parquet"
 
 
 @lru_cache(maxsize=1)
 def load_basic() -> pd.DataFrame:
+    """读取股票基础信息。
+
+    基础信息被名称解析、ST 过滤、上市状态过滤频繁使用，缓存后可以减少
+    列式数据文件反复读取。
+    """
     return pd.read_parquet(stock_basic_path())
 
 
 @lru_cache(maxsize=1)
 def daily_index_only() -> pd.DataFrame:
+    """只读取日线索引，用于快速拿到交易日列表。"""
     return pd.read_parquet(stock_daily_path(), columns=[])
 
 
 @lru_cache(maxsize=1)
 def trading_days() -> pd.DatetimeIndex:
+    """返回全市场交易日序列。
+
+    回测、历史回看、前后 N 个交易日窗口都基于这条统一交易日历，
+    避免自然日和交易日混用。
+    """
     idx = daily_index_only().index.get_level_values("trade_date").unique()
     return pd.DatetimeIndex(pd.to_datetime(idx)).sort_values()
 
 
 def normalize_code(code: str) -> str:
+    """把 6 位股票代码补成数据源使用的标准股票代码。
+
+    例如 600000 -> 600000.SH，000001 -> 000001.SZ。
+    如果调用方已经传入 000001.SZ，则直接返回。
+    """
     code = code.strip().upper()
     if "." in code:
         return code
@@ -70,17 +93,16 @@ def normalize_code(code: str) -> str:
 
 
 def resolve_stock_query(query: str) -> str:
-    """Resolve a stock code or name to ts_code.
+    """把股票代码或名称解析为标准股票代码。
 
-    Accepted examples:
+    支持示例：
     - 000001
     - 000001.SZ
     - 平安银行
-    - partial names such as "平安"
+    - 名称片段，例如“平安”
 
-    If a partial name matches multiple stocks, the first active/listed match in
-    stock_basic_data is returned. The frontend can use this as a convenient
-    "quick inspect" lookup without requiring an exact code.
+    如果名称片段匹配多只股票，优先返回仍在上市状态的第一条记录。
+    这个函数主要服务于“数据查看”页的快速查询，而不是严肃选股。
     """
     q = query.strip().upper()
     if not q:
@@ -101,6 +123,11 @@ def resolve_stock_query(query: str) -> str:
 
 
 def load_daily_range(start: str, end: str, columns: list[str] | None = None) -> pd.DataFrame:
+    """读取一段日期范围内的全市场日线数据。
+
+    columns 用于限制字段，减少 parquet IO。策略里做涨停回看、均线计算时
+    会按需只取 close/pct_chg 等字段。
+    """
     cols = columns or DAILY_COLS
     df = pd.read_parquet(
         stock_daily_path(),
@@ -114,12 +141,11 @@ def load_daily_range(start: str, end: str, columns: list[str] | None = None) -> 
 
 
 def load_daily_date(day: str | pd.Timestamp, columns: list[str] | None = None) -> pd.DataFrame:
-    """Load all stock daily rows for one trading day.
+    """读取某一个交易日的全市场日线数据。
 
-    This is the source for the article's five daily filters. Importantly, fields
-    such as circ_mv, turnover_rate, volume_ratio and is_st are read from the
-    requested date itself, not from the latest snapshot, so historical selection
-    does not accidentally see future market-cap or ST information.
+    这是文章“五个日线条件”的数据源。特别注意：circ_mv、turnover_rate、
+    volume_ratio、is_st 等字段都来自请求日期当天，而不是最新快照。
+    这样历史回测不会偷看到未来市值或未来 ST 状态。
     """
     ts = pd.Timestamp(day).normalize()
     cols = columns or DAILY_COLS
@@ -136,6 +162,7 @@ def load_daily_date(day: str | pd.Timestamp, columns: list[str] | None = None) -
 
 
 def load_daily_for_codes(start: str, end: str, codes: list[str]) -> pd.DataFrame:
+    """读取指定股票集合在日期区间内的日线数据。"""
     df = load_daily_range(start, end, DAILY_COLS)
     if codes:
         df = df[df["ts_code"].isin(set(codes))]
@@ -143,11 +170,11 @@ def load_daily_for_codes(start: str, end: str, codes: list[str]) -> pd.DataFrame
 
 
 def load_stock_minutes(code: str, day: str | pd.Timestamp, freq: str = "15min") -> pd.DataFrame:
-    """Load one stock's intraday bars for one trading day.
+    """读取单只股票某一天的分钟线。
 
-    The current strategy uses 15-minute bars because the article's key decision
-    point is after 14:30. The data folder also has 1-minute bars, but 15-minute
-    bars make the rule faster and less noisy for broad-universe backtests.
+    当前策略主流程使用 15 分钟线，因为文章的关键判断点是 14:30 后。
+    数据查看页可以查看 1 分钟线，但全市场回测如果全部用 1 分钟线会慢很多，
+    所以策略计算默认使用 15 分钟线。
     """
     ts_code = normalize_code(code)
     path = stock_minute_path(ts_code, freq)
@@ -171,11 +198,10 @@ def load_stock_minutes(code: str, day: str | pd.Timestamp, freq: str = "15min") 
 
 
 def load_index_minutes(code: str, day: str | pd.Timestamp, freq: str = "15min") -> pd.DataFrame:
-    """Load benchmark intraday bars, usually沪深300.
+    """读取指数某一天的分钟线，通常是沪深300。
 
-    These bars drive the "大盘 14:30 后处于上升趋势" and "放量大跌不进场"
-    checks. Returning an empty frame lets callers fail the market rule clearly
-    instead of silently pretending the big-market filter passed.
+    这些数据用于判断“大盘 14:30 后是否走强”和“大盘是否放量大跌”。
+    如果数据缺失，返回空 DataFrame，让调用方明确地让规则失败，而不是默认放行。
     """
     path = index_minute_path(code, freq)
     if not path.exists():
@@ -198,6 +224,7 @@ def load_index_minutes(code: str, day: str | pd.Timestamp, freq: str = "15min") 
 
 
 def load_index_daily(code: str, start: str, end: str) -> pd.DataFrame:
+    """读取指数日线区间数据，用于基准净值和 MA20 大盘过滤。"""
     path = index_daily_path(code)
     if not path.exists():
         return pd.DataFrame()
@@ -209,6 +236,7 @@ def load_index_daily(code: str, start: str, end: str) -> pd.DataFrame:
 
 
 def previous_trading_dates(day: str | pd.Timestamp, n: int) -> list[pd.Timestamp]:
+    """返回包含指定日期在内的最近若干个交易日。"""
     day_ts = pd.Timestamp(day).normalize()
     days = trading_days()
     past = days[days <= day_ts]
@@ -216,6 +244,7 @@ def previous_trading_dates(day: str | pd.Timestamp, n: int) -> list[pd.Timestamp
 
 
 def next_trading_day(day: str | pd.Timestamp) -> pd.Timestamp | None:
+    """返回指定日期之后的下一个交易日；如果没有后续交易日则返回空值。"""
     day_ts = pd.Timestamp(day).normalize()
     days = trading_days()
     future = days[days > day_ts]
@@ -223,11 +252,10 @@ def next_trading_day(day: str | pd.Timestamp) -> pd.Timestamp | None:
 
 
 def enrich_daily(day_df: pd.DataFrame) -> pd.DataFrame:
-    """Attach stock names and compute normalized daily metrics.
+    """补充股票名称，并计算策略需要的标准化日线指标。
 
-    - circ_mv in the data is 万元, so float_mktcap is converted to 亿元.
-    - amplitude follows the article's "日内振幅 5% 以内" idea:
-      (high - low) / pre_close * 100.
+    - 数据里的 circ_mv 单位是万元，这里转换成亿元，便于和前端参数一致。
+    - amplitude 对应文章里的“日内振幅”，计算为 (high - low) / pre_close * 100。
     """
     if day_df.empty:
         return day_df
@@ -240,6 +268,7 @@ def enrich_daily(day_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def data_info() -> DataInfo:
+    """汇总本地数据目录状态，供前端“数据查看”页展示。"""
     daily_ok = stock_daily_path().exists()
     basic_ok = stock_basic_path().exists()
     start = end = None
@@ -265,17 +294,17 @@ def data_info() -> DataInfo:
 
 
 def minute_bars_response(code: str, day: str, freq: str = "15min") -> list[MinuteBar]:
-    """Build frontend-friendly minute bars with running VWAP.
+    """构造前端图表可直接使用的股票分钟线数据。
 
-    The UI uses this to visually audit whether a selected stock actually
-    stayed above the average-price line near the tail session.
+    除开高低收和成交量外，还会附带累计 VWAP。前端用它复盘候选股尾盘
+    是否真的站在均价线之上。
     """
     df = load_stock_minutes(code, day, freq)
     return _bars_from_frame(df)
 
 
 def stock_window_response(code: str, center_day: str, radius: int = 5, freq: str = "1min") -> list[tuple[str, list[MinuteBar]]]:
-    """Return minute bars for the trading-day window around a center date."""
+    """返回中心日前后若干个交易日的分钟线窗口。"""
     ts_code = normalize_code(code)
     days = trading_days()
     center = pd.Timestamp(center_day).normalize()
@@ -292,13 +321,13 @@ def stock_window_response(code: str, center_day: str, radius: int = 5, freq: str
 
 
 def index_minute_bars_response(code: str, day: str, freq: str = "15min") -> list[MinuteBar]:
-    """Build frontend-friendly index minute bars."""
+    """构造前端图表可直接使用的指数分钟线数据。"""
     df = load_index_minutes(code, day, freq)
     return _bars_from_frame(df)
 
 
 def _bars_from_frame(df: pd.DataFrame) -> list[MinuteBar]:
-    """Convert a raw minute DataFrame into chart-ready bars with VWAP."""
+    """把原始分钟线表格转成图表需要的分钟柱列表。"""
     if df.empty:
         return []
     amount_cum = df["amount"].cumsum()
@@ -307,9 +336,8 @@ def _bars_from_frame(df: pd.DataFrame) -> list[MinuteBar]:
     close = df["close"].astype(float)
     ratio = (vwap.astype(float) / close.replace(0, pd.NA)).dropna()
     if not ratio.empty and (ratio.median() < 0.5 or ratio.median() > 1.5):
-        # Some index files store amount/volume in different units, making
-        # amount/vol unusable as a price-level VWAP. Fall back to a cumulative
-        # volume-weighted close so the "均价线" remains visually meaningful.
+        # 有些指数文件里的成交额和成交量单位不一致，直接相除会得到离价格很远的数。
+        # 这时退回到“成交量加权收盘价”的累计均线，保证前端看到的均价线仍有意义。
         weighted = (close * df["vol"]).cumsum()
         vwap = (weighted / vol_cum).ffill().fillna(close)
     bars: list[MinuteBar] = []
