@@ -71,6 +71,6 @@ def test_stock_window_endpoint_returns_centered_trading_days():
     assert body["code"] == "000001.SZ"
     assert body["name"] == "平安银行"
     assert body["center_date"] == "2026-04-24"
-    assert len(body["days"]) == 3
-    assert body["days"][-1]["trade_date"] == "2026-04-24"
-    assert len(body["days"][-1]["bars"]) > 100
+    assert len(body["days"]) == 5
+    assert body["days"][2]["trade_date"] == "2026-04-24"
+    assert len(body["days"][2]["bars"]) > 100

@@ -34,6 +34,7 @@ from app.services.optimizer import run_parameter_sweep
 from app.services.optimization_records import (
     append_optimization_result,
     create_optimization_record,
+    delete_optimization_record,
     list_optimization_records,
     load_optimization_record,
     update_optimization_progress,
@@ -80,6 +81,30 @@ def _save_opt_job(job: OptimizationProgress) -> None:
 def _get_opt_job(job_id: str) -> OptimizationProgress | None:
     with _opt_jobs_lock:
         return _opt_jobs.get(job_id)
+
+
+def _persist_optimization_progress(job_id: str, progress: OptimizationProgress) -> None:
+    """把参数优化进度落盘。
+
+    优化任务的实时进度已经先写入内存，前端轮询时可以立刻看到。
+    本地 json 记录只是为了历史记录和中断后续跑，所以遇到 Windows 文件短暂占用时，
+    这里记录日志但不让整轮优化失败。
+    """
+    try:
+        update_optimization_progress(job_id, progress)
+    except OSError as exc:
+        print(f"保存参数优化进度失败，任务继续运行: {exc}")
+
+
+def _persist_optimization_result(job_id: str, item) -> None:
+    """把单个参数组合结果追加到历史记录。
+
+    追加结果很频繁，偶发的文件占用不应该中断正在运行的参数优化。
+    """
+    try:
+        append_optimization_result(job_id, item)
+    except OSError as exc:
+        print(f"保存参数优化结果失败，任务继续运行: {exc}")
 
 
 def _resolve_index_query(query: str) -> str:
@@ -227,10 +252,10 @@ def _launch_optimization(job_id: str, params: OptimizationParams, initial_result
                 best=best,
             )
             _save_opt_job(current_progress)
-            update_optimization_progress(job_id, current_progress)
+            _persist_optimization_progress(job_id, current_progress)
 
         def checkpoint(item) -> None:
-            append_optimization_result(job_id, item)
+            _persist_optimization_result(job_id, item)
 
         try:
             report(1, 0, 0, "开始参数优化", [])
@@ -253,7 +278,7 @@ def _launch_optimization(job_id: str, params: OptimizationParams, initial_result
                     best=best,
                 )
                 _save_opt_job(final_progress)
-                update_optimization_progress(job_id, final_progress)
+                _persist_optimization_progress(job_id, final_progress)
                 return
             final_progress = OptimizationProgress(
                 job_id=job_id,
@@ -267,7 +292,7 @@ def _launch_optimization(job_id: str, params: OptimizationParams, initial_result
                 best=best,
             )
             _save_opt_job(final_progress)
-            update_optimization_progress(job_id, final_progress)
+            _persist_optimization_progress(job_id, final_progress)
         except InterruptedError:
             job = _get_opt_job(job_id)
             final_progress = OptimizationProgress(
@@ -280,7 +305,7 @@ def _launch_optimization(job_id: str, params: OptimizationParams, initial_result
                 best=job.best if job else [],
             )
             _save_opt_job(final_progress)
-            update_optimization_progress(job_id, final_progress)
+            _persist_optimization_progress(job_id, final_progress)
         except Exception as exc:
             job = _get_opt_job(job_id)
             final_progress = OptimizationProgress(
@@ -294,7 +319,7 @@ def _launch_optimization(job_id: str, params: OptimizationParams, initial_result
                 error=str(exc),
             )
             _save_opt_job(final_progress)
-            update_optimization_progress(job_id, final_progress)
+            _persist_optimization_progress(job_id, final_progress)
         finally:
             # 任务结束后移除取消事件，避免内存里积累已经结束的任务控制对象。
             _opt_cancel_events.pop(job_id, None)
@@ -331,6 +356,19 @@ async def get_optimization_record(record_id: str):
         raise HTTPException(status_code=404, detail="参数优化记录不存在")
 
 
+@router.delete("/optimize/records/{record_id}")
+async def remove_optimization_record(record_id: str):
+    """删除一条本地参数优化记录。"""
+    active = _get_opt_job(record_id)
+    if record_id in _opt_cancel_events or (active and active.status in {"queued", "running"}):
+        raise HTTPException(status_code=409, detail="参数优化任务仍在运行，请先取消或等待结束")
+    try:
+        await run_in_threadpool(delete_optimization_record, record_id)
+        return {"ok": True}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="参数优化记录不存在")
+
+
 @router.post("/optimize/records/{record_id}/resume", response_model=OptimizationStartResponse)
 async def resume_optimization(record_id: str):
     """从本地优化记录继续跑尚未完成的参数组合。"""
@@ -363,6 +401,8 @@ async def cancel_optimization(job_id: str):
         await run_in_threadpool(update_optimization_progress, job_id, updated)
     except FileNotFoundError:
         pass
+    except OSError as exc:
+        print(f"保存参数优化取消状态失败: {exc}")
     return {"ok": True}
 
 

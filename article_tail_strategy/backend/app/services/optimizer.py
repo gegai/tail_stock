@@ -100,7 +100,6 @@ def _score_item(
     注意：这只是参数筛选的排序分，不是金融意义上的标准指标。真正决策时仍然
     要结合交易明细、年度收益和样本数量人工复核。
     """
-    min_trade_count = int(request_data.get("min_trade_count", 80))
     max_drawdown_limit = float(request_data.get("max_drawdown_limit", -0.20))
 
     # 卡玛比率近似衡量“承担一单位回撤换来了多少年化收益”。
@@ -108,7 +107,6 @@ def _score_item(
     calmar = annualized_return / abs(max_drawdown) if max_drawdown < 0 else annualized_return
 
     # 交易数不是越多越好，但太少会过拟合；达到目标交易数后继续加分有限。
-    trade_score = min(trade_count / max(min_trade_count, 1), 1.5) * 10
 
     # 年度稳定性只看正收益年份占比，避免某个组合只靠一个年份的大行情撑起来。
     stability = 0.0
@@ -123,8 +121,7 @@ def _score_item(
         + total_return * 100 * 0.20
         + win_rate * 100 * 0.10
         + calmar * 10 * 0.15
-        + trade_score * 0.05
-        + stability * 0.05
+        + stability * 0.10
     )
 
     # 硬惩罚：亏钱策略不能因为胜率高、交易多就排到前面。
@@ -134,9 +131,12 @@ def _score_item(
         score -= 30 + abs(total_return) * 100 * 0.30
 
     # 样本不足按比例扣分。比如目标 80 笔，只有 40 笔，就扣一半惩罚。
-    if trade_count < min_trade_count:
-        shortfall = 1 - trade_count / max(min_trade_count, 1)
-        score -= 30 * shortfall
+    # ??????????????10???????????
+    # 10?30???????30???????????
+    if trade_count < 10:
+        score -= 40
+    elif trade_count < 30:
+        score -= (30 - trade_count) / 20 * 15
 
     # 回撤超过用户设置的红线时额外扣分。
     if max_drawdown < max_drawdown_limit:

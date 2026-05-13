@@ -23,6 +23,7 @@ export interface StrategyParams {
   require_market_up: boolean;
   require_intraday_checks: boolean;
   require_index_above_ma20: boolean;
+  decision_time: string;
   min_market_tail_return_pct: number;
   min_tail_return_pct: number;
   min_close_vs_vwap_pct: number;
@@ -157,7 +158,6 @@ export interface OptimizationParams {
   ranges: SweepRange[];
   max_workers: number;
   max_combinations: number;
-  min_trade_count: number;
   max_drawdown_limit: number;
   top_n: number;
 }
@@ -273,6 +273,10 @@ export async function getOptimizationRecord(recordId: string) {
 
 export async function resumeOptimization(recordId: string) {
   return (await api.post<{ job_id: string }>(`/api/optimize/records/${recordId}/resume`)).data;
+}
+
+export async function deleteOptimizationRecord(recordId: string) {
+  return (await api.delete<{ ok: boolean }>(`/api/optimize/records/${recordId}`)).data;
 }
 
 export async function getBacktestRecords() {

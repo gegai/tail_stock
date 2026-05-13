@@ -39,13 +39,13 @@ def test_build_param_combinations_rejects_too_many_variants():
 
 
 def test_optimizer_score_penalizes_low_trade_count_and_large_drawdown():
-    request_data = {"min_trade_count": 80, "max_drawdown_limit": -0.20}
+    request_data = {"max_drawdown_limit": -0.20}
     weak_score = _score_item(
         total_return=0.20,
         annualized_return=0.08,
         max_drawdown=-0.35,
         win_rate=0.55,
-        trade_count=20,
+        trade_count=8,
         yearly_returns={"2023": 0.05, "2024": -0.02},
         request_data=request_data,
     )
@@ -54,7 +54,7 @@ def test_optimizer_score_penalizes_low_trade_count_and_large_drawdown():
         annualized_return=0.08,
         max_drawdown=-0.12,
         win_rate=0.55,
-        trade_count=100,
+        trade_count=35,
         yearly_returns={"2023": 0.05, "2024": 0.02},
         request_data=request_data,
     )
@@ -63,7 +63,7 @@ def test_optimizer_score_penalizes_low_trade_count_and_large_drawdown():
 
 
 def test_optimizer_score_does_not_rank_losing_strategy_above_profitable_strategy():
-    request_data = {"min_trade_count": 80, "max_drawdown_limit": -0.20}
+    request_data = {"max_drawdown_limit": -0.20}
     losing_high_win_rate = _score_item(
         total_return=-0.08,
         annualized_return=-0.03,
@@ -84,3 +84,27 @@ def test_optimizer_score_does_not_rank_losing_strategy_above_profitable_strategy
     )
 
     assert profitable_lower_win_rate > losing_high_win_rate
+
+
+def test_optimizer_score_does_not_reward_trade_count_above_sample_floor():
+    request_data = {"max_drawdown_limit": -0.20}
+    thirty_trades = _score_item(
+        total_return=0.10,
+        annualized_return=0.05,
+        max_drawdown=-0.10,
+        win_rate=0.50,
+        trade_count=30,
+        yearly_returns={"2025": 0.10},
+        request_data=request_data,
+    )
+    eighty_trades = _score_item(
+        total_return=0.10,
+        annualized_return=0.05,
+        max_drawdown=-0.10,
+        win_rate=0.50,
+        trade_count=80,
+        yearly_returns={"2025": 0.10},
+        request_data=request_data,
+    )
+
+    assert eighty_trades == thirty_trades

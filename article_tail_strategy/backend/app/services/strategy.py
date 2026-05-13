@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -14,8 +15,14 @@ from app.services.data import (
     load_index_daily,
     load_index_minutes,
     load_stock_minutes,
+    load_stock_minutes_for_codes_day,
+    load_stock_minutes_for_day,
     previous_trading_dates,
 )
+
+VOLUME_RATIO_LOOKBACK = 20
+TRADING_15MIN_BARS = 16
+SNAPSHOT_WORKERS = 8
 
 
 def rule(name: str, passed: bool, actual=None, threshold: str | None = None, note: str = "") -> RuleResult:
@@ -34,6 +41,81 @@ def _time_part(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series).dt.strftime("%H:%M")
 
 
+def _bars_until(df: pd.DataFrame, time_text: str) -> pd.DataFrame:
+    """Return only bars visible at the decision timestamp."""
+    if df.empty:
+        return df
+    return df[_time_part(df["trade_time"]) <= time_text].copy()
+
+
+def _partial_amplitude(bars: pd.DataFrame, pre_close: float) -> float:
+    if bars.empty or not pre_close:
+        return float("nan")
+    return (float(bars["high"].max()) - float(bars["low"].min())) / pre_close * 100
+
+
+def _partial_turnover_rate(bars: pd.DataFrame, circ_mv: float) -> float:
+    if bars.empty or not circ_mv:
+        return float("nan")
+    close = float(bars.iloc[-1]["close"])
+    # 分钟线 vol 是股，日线 vol 是手；circ_mv 单位是万元。这里返回百分比。
+    return float(bars["vol"].sum()) * close / circ_mv / 100
+
+
+def _estimate_volume_ratio(current_vol: float, visible_bar_count: int, avg_daily_vol: float) -> float:
+    if current_vol <= 0 or avg_daily_vol <= 0:
+        return float("nan")
+    visible_fraction = min(max(visible_bar_count / TRADING_15MIN_BARS, 0.10), 1.0)
+    # 分钟线 vol 是股，历史日线 vol 是手，先统一到手。
+    estimated_full_day_vol = current_vol / 100 / visible_fraction
+    return estimated_full_day_vol / avg_daily_vol
+
+
+def _historical_avg_volume(day: str | pd.Timestamp, codes: set[str]) -> dict[str, float]:
+    lookback = previous_trading_dates(day, VOLUME_RATIO_LOOKBACK, include_current=False)
+    if not lookback or not codes:
+        return {}
+    hist = load_daily_range(str(lookback[0].date()), str(lookback[-1].date()), ["vol"])
+    hist = hist[hist["ts_code"].isin(codes)]
+    if hist.empty:
+        return {}
+    return hist.groupby("ts_code")["vol"].mean().astype(float).to_dict()
+
+
+def _snapshot_row(row: pd.Series, day: str | pd.Timestamp, params: StrategyParams, avg_daily_vol: float) -> pd.Series | None:
+    code = str(row["ts_code"])
+    bars = _bars_until(load_stock_minutes(code, day, "15min"), params.decision_time)
+    if bars.empty:
+        return None
+    row = row.copy()
+    decision_close = float(bars.iloc[-1]["close"])
+    row["close"] = decision_close
+    row["amplitude"] = _partial_amplitude(bars, float(row["pre_close"]))
+    row["turnover_rate"] = _partial_turnover_rate(bars, float(row["circ_mv"]))
+    row["volume_ratio"] = _estimate_volume_ratio(
+        float(bars["vol"].sum()),
+        len(bars),
+        avg_daily_vol,
+    )
+    return row
+
+
+def _snapshot_row_from_bars(row: pd.Series, bars: pd.DataFrame, avg_daily_vol: float) -> pd.Series | None:
+    if bars.empty:
+        return None
+    row = row.copy()
+    decision_close = float(bars.iloc[-1]["close"])
+    row["close"] = decision_close
+    row["amplitude"] = _partial_amplitude(bars, float(row["pre_close"]))
+    row["turnover_rate"] = _partial_turnover_rate(bars, float(row["circ_mv"]))
+    row["volume_ratio"] = _estimate_volume_ratio(
+        float(bars["vol"].sum()),
+        len(bars),
+        avg_daily_vol,
+    )
+    return row
+
+
 def market_tail_rules(day: str | pd.Timestamp, params: StrategyParams) -> list[RuleResult]:
     """把文章里的大盘条件转换成可复现的机器规则。
 
@@ -46,21 +128,20 @@ def market_tail_rules(day: str | pd.Timestamp, params: StrategyParams) -> list[R
     if df.empty:
         return [rule("大盘15分钟数据可用", False, "missing", note="未找到沪深30015分钟数据")]
 
-    # 文章强调“14:30 后大盘不能走弱”，所以这里单独切出尾盘区间。
-    times = _time_part(df["trade_time"])
-    tail = df[times >= "14:30"].copy()
+    # 选股时点由参数决定，不能使用该时点之后才会出现的 K 线。
+    visible = _bars_until(df, params.decision_time)
+    tail = visible.tail(3).copy()
     if len(tail) < 2:
-        return [rule("大盘14:30后K线完整", False, len(tail), ">=2")]
+        return [rule(f"大盘{params.decision_time}前K线完整", False, len(tail), ">=2")]
 
     first_close = float(tail.iloc[0]["close"])
     last_close = float(tail.iloc[-1]["close"])
     tail_ret = (last_close / first_close - 1) * 100
 
-    day_open = float(df.iloc[0]["open"])
-    day_close = float(df.iloc[-1]["close"])
-    day_ret = (day_close / day_open - 1) * 100
+    day_open = float(visible.iloc[0]["open"])
+    day_ret = (last_close / day_open - 1) * 100
 
-    pre_tail = df[times < "14:30"]
+    pre_tail = visible.iloc[:-len(tail)] if len(visible) > len(tail) else visible.iloc[0:0]
     pre_tail_avg_vol = float(pre_tail["vol"].mean()) if not pre_tail.empty else 0.0
     tail_avg_vol = float(tail["vol"].mean())
     tail_vol_ratio = tail_avg_vol / pre_tail_avg_vol if pre_tail_avg_vol else 0.0
@@ -73,7 +154,7 @@ def market_tail_rules(day: str | pd.Timestamp, params: StrategyParams) -> list[R
     # 次日个股表现仍然偏弱，所以这里改成可配置的最低尾盘涨幅门槛。
     rules = [
         rule(
-            "大盘14:30后15分钟K线有效上升",
+            f"大盘截至{params.decision_time}短线有效上升",
             tail_ret >= params.min_market_tail_return_pct,
             tail_ret,
             f">= {params.min_market_tail_return_pct}%",
@@ -82,7 +163,7 @@ def market_tail_rules(day: str | pd.Timestamp, params: StrategyParams) -> list[R
             "大盘未放量大跌",
             not crash,
             f"day={day_ret:.2f}%, tail={tail_ret:.2f}%, tail_vol_ratio={tail_vol_ratio:.2f}",
-            "当日跌幅>-1.5% 或 14:30后跌幅>-0.3% 或 尾盘量比<1.5",
+            f"截至{params.decision_time}跌幅>-1.5% 或 短线跌幅>-0.3% 或 尾盘量比<1.5",
         ),
     ]
     if index_trend_rule is not None:
@@ -99,15 +180,18 @@ def _index_ma20_rule(day: str | pd.Timestamp, params: StrategyParams) -> RuleRes
     """
     if not params.require_index_above_ma20:
         return None
-    lookback = previous_trading_dates(day, 40)
+    lookback = previous_trading_dates(day, 40, include_current=False)
     if len(lookback) < 20:
         return rule("沪深300站上MA20", False, len(lookback), ">=20日")
-    hist = load_index_daily(settings.benchmark_code, str(lookback[0].date()), str(pd.Timestamp(day).date()))
+    hist = load_index_daily(settings.benchmark_code, str(lookback[0].date()), str(lookback[-1].date()))
     if len(hist) < 20:
         return rule("沪深300站上MA20", False, len(hist), ">=20日")
+    bars = _bars_until(load_index_minutes(settings.benchmark_code, day, "15min"), params.decision_time)
+    if bars.empty:
+        return rule("沪深300站上MA20", False, "missing", f"{params.decision_time}价格可用")
     close = hist["close"].astype(float)
     ma20 = float(close.rolling(20).mean().iloc[-1])
-    last = float(close.iloc[-1])
+    last = float(bars.iloc[-1]["close"])
     return rule("沪深300站上MA20", last > ma20, f"close={last:.2f}, ma20={ma20:.2f}", "close > MA20")
 
 
@@ -126,31 +210,67 @@ def daily_screen(day: str | pd.Timestamp, params: StrategyParams) -> tuple[pd.Da
     # 这些不是文章核心条件，但属于回测必须有的现实交易约束。
     df = df[df["list_status"].fillna("L") == "L"].copy()
     df = df[~df["is_st"].fillna(False).astype(bool)]
-    # 历史 is_st 标记可能缺失或滞后，所以再用股票名称做一层兜底过滤，
-    # 避免 ST/*ST 股票因为日线标记异常而混入候选池。
-    df = df[~df["name"].fillna("").astype(str).str.upper().str.contains("ST", regex=False)]
     df = df[df["suspend_type"].fillna("N") == "N"]
     df = df[df["listed_days"].fillna(0) >= 60]
     df = df[df["close"].notna() & (df["close"] > 0)]
     base_count = len(df)
 
-    # 文章里的日线五条件在这里落地：振幅、市值、换手、量比、近期涨停记忆。
-    df = df[df["amplitude"].notna() & (df["amplitude"] <= params.max_amplitude)]
     df = df[df["float_mktcap"].notna() & (df["float_mktcap"] <= params.max_float_mktcap)]
+    # 全日换手率低于下限时，截至决策时点的换手率也不可能达标，可以先安全剔除。
     df = df[df["turnover_rate"].notna() & (df["turnover_rate"] >= params.min_turnover_rate)]
-    df = df[df["volume_ratio"].notna() & (df["volume_ratio"] >= params.min_volume_ratio)]
-    df = df[df["volume_ratio"].notna() & (df["volume_ratio"] <= params.max_volume_ratio)]
     if df.empty:
         return df, base_count
 
-    lookback_days = previous_trading_dates(day, params.limitup_lookback)
-    start = str(lookback_days[0].date()) if lookback_days else str(pd.Timestamp(day).date())
-    end = str(pd.Timestamp(day).date())
+    lookback_days = previous_trading_dates(day, params.limitup_lookback, include_current=False)
+    if not lookback_days:
+        return df.iloc[0:0], base_count
+    start = str(lookback_days[0].date())
+    end = str(lookback_days[-1].date())
     hist = load_daily_range(start, end, ["pct_chg"])
-    # 涨停历史用“当日涨跌幅不低于 9.9%”近似。不同股票涨跌停制度不同，
-    # 这里先用保守统一阈值表达“近期有涨停记忆”。
+    # 涨停历史只使用决策日以前的日线，避免把当天尚未收盘的信息算进去。
     limitup_codes = set(hist.loc[hist["pct_chg"] >= 9.9, "ts_code"].unique())
     df = df[df["ts_code"].isin(limitup_codes)]
+    if df.empty:
+        return df, base_count
+
+    avg_vol_by_code = _historical_avg_volume(day, set(df["ts_code"].astype(str)))
+
+    # 日内条件在决策时点做快照，不能使用收盘后才知道的全日振幅、换手和量比。
+    rows = list(df.iterrows())
+    snapshots: list[pd.Series] = []
+    candidate_codes = tuple(df["ts_code"].astype(str).tolist())
+    day_minutes = _bars_until(load_stock_minutes_for_codes_day(candidate_codes, day, "15min"), params.decision_time)
+    if day_minutes.empty:
+        day_minutes = _bars_until(load_stock_minutes_for_day(day, "15min"), params.decision_time)
+    if rows and not day_minutes.empty:
+        grouped_minutes = dict(tuple(day_minutes.groupby("ts_code", sort=False)))
+        snapshots = [
+            snapshot
+            for _, row in rows
+            if (
+                snapshot := _snapshot_row_from_bars(
+                    row,
+                    grouped_minutes.get(str(row["ts_code"]), pd.DataFrame()),
+                    avg_vol_by_code.get(str(row["ts_code"]), 0.0),
+                )
+            ) is not None
+        ]
+    elif rows:
+        with ThreadPoolExecutor(max_workers=min(SNAPSHOT_WORKERS, len(rows))) as executor:
+            futures = [
+                executor.submit(_snapshot_row, row, day, params, avg_vol_by_code.get(str(row["ts_code"]), 0.0))
+                for _, row in rows
+            ]
+            snapshots = [snapshot for future in futures if (snapshot := future.result()) is not None]
+    df = pd.DataFrame(snapshots)
+    if df.empty:
+        return df, base_count
+
+    # 文章里的五条件在这里落地：截至决策时点振幅、流通市值、换手、量比、近期涨停记忆。
+    df = df[df["amplitude"].notna() & (df["amplitude"] <= params.max_amplitude)]
+    df = df[df["turnover_rate"].notna() & (df["turnover_rate"] >= params.min_turnover_rate)]
+    df = df[df["volume_ratio"].notna() & (df["volume_ratio"] >= params.min_volume_ratio)]
+    df = df[df["volume_ratio"].notna() & (df["volume_ratio"] <= params.max_volume_ratio)]
     return df, base_count
 
 
@@ -165,7 +285,6 @@ def stock_tail_metrics(code: str, day: str | pd.Timestamp, params: StrategyParam
     if df.empty:
         return [rule("个股15分钟数据可用", False, "missing")], {}
 
-    times = _time_part(df["trade_time"])
     # 用当日累计成交额除以累计成交量近似分时均价线，用于判断尾盘是否站上均价线。
     amount_cum = df["amount"].cumsum()
     vol_cum = df["vol"].replace(0, pd.NA).cumsum()
@@ -173,12 +292,13 @@ def stock_tail_metrics(code: str, day: str | pd.Timestamp, params: StrategyParam
     df = df.copy()
     df["vwap"] = vwap
 
-    # 核心买点只看 14:30 之后：文章强调尾盘确认，而不是全天任意时刻追涨。
-    tail = df[times >= "14:30"]
-    pre_tail = df[times < "14:30"]
-    morning = df[times < "14:30"]
+    visible = _bars_until(df, params.decision_time)
+    # 核心买点固定在决策时点：只看当时已经形成的短线形态。
+    tail = visible.tail(3)
+    pre_tail = visible.iloc[:-len(tail)] if len(visible) > len(tail) else visible.iloc[0:0]
+    morning = visible.iloc[:-1]
     if len(tail) < 2:
-        return [rule("个股14:30后K线完整", False, len(tail), ">=2")], {}
+        return [rule(f"个股{params.decision_time}前K线完整", False, len(tail), ">=2")], {}
 
     tail_ret = (float(tail.iloc[-1]["close"]) / float(tail.iloc[0]["close"]) - 1) * 100
     close_vs_vwap = (float(tail.iloc[-1]["close"]) / float(tail.iloc[-1]["vwap"]) - 1) * 100
@@ -193,11 +313,11 @@ def stock_tail_metrics(code: str, day: str | pd.Timestamp, params: StrategyParam
         dev_low = (morning["low"] / morning["vwap"] - 1).abs()
         morning_band = float(pd.concat([dev_high, dev_low], axis=1).max(axis=1).median() * 100)
 
-    # 这些是个股尾盘质量的核心门槛。只是微涨不够，必须 14:30 到收盘有
-    # 明确涨幅，并且收盘价相对当日均价线有一定缓冲。
+    # 这些是个股尾盘质量的核心门槛。只是微涨不够，必须在决策时点前形成
+    # 明确涨幅，并且当前价格相对当日均价线有一定缓冲。
     rules = [
-        rule("个股14:30后分时有效上升", tail_ret >= params.min_tail_return_pct, tail_ret, f">= {params.min_tail_return_pct}%"),
-        rule("尾盘收盘站上均价线", close_vs_vwap >= params.min_close_vs_vwap_pct, close_vs_vwap, f">= {params.min_close_vs_vwap_pct}%"),
+        rule(f"个股截至{params.decision_time}分时有效上升", tail_ret >= params.min_tail_return_pct, tail_ret, f">= {params.min_tail_return_pct}%"),
+        rule(f"{params.decision_time}价格站上均价线", close_vs_vwap >= params.min_close_vs_vwap_pct, close_vs_vwap, f">= {params.min_close_vs_vwap_pct}%"),
         rule("尾盘成交量放大", tail_vol_ratio >= params.tail_volume_multiplier, tail_vol_ratio, f">= {params.tail_volume_multiplier}"),
         rule("盘中围绕均价线平稳震荡", morning_band <= params.max_morning_vwap_band_pct, morning_band, f"<= {params.max_morning_vwap_band_pct}%"),
     ]
@@ -210,16 +330,16 @@ def stock_tail_metrics(code: str, day: str | pd.Timestamp, params: StrategyParam
     }
 
 
-def trend_rules(code: str, day: str | pd.Timestamp, params: StrategyParams) -> list[RuleResult]:
+def trend_rules(code: str, day: str | pd.Timestamp, params: StrategyParams, current_price: float) -> list[RuleResult]:
     """近似表达文章里的中期上升趋势要求。
 
     文章偏好中期趋势清晰、短期经过整理但尚未过热的股票。
     这里用 close > MA20 > MA60 表达中期趋势，用短期回调和近期振幅控制过热程度。
     """
-    lookback = previous_trading_dates(day, 80)
+    lookback = previous_trading_dates(day, 80, include_current=False)
     if len(lookback) < 60:
         return [rule("中期趋势数据足够", False, len(lookback), ">=60")]
-    hist = load_daily_range(str(lookback[0].date()), str(pd.Timestamp(day).date()), ["close", "high", "low", "pre_close"])
+    hist = load_daily_range(str(lookback[0].date()), str(lookback[-1].date()), ["close", "high", "low", "pre_close"])
     hist = hist[hist["ts_code"] == code].sort_values("trade_date")
     if len(hist) < 60:
         return [rule("中期趋势数据足够", False, len(hist), ">=60")]
@@ -228,8 +348,8 @@ def trend_rules(code: str, day: str | pd.Timestamp, params: StrategyParams) -> l
     close = hist["close"]
     ma20 = close.rolling(20).mean().iloc[-1]
     ma60 = close.rolling(60).mean().iloc[-1]
-    last = close.iloc[-1]
-    prev5 = close.iloc[-6:-1].max()
+    last = float(current_price)
+    prev5 = close.tail(5).max()
     pullback = (last / prev5 - 1) * 100 if prev5 else 0.0
     # 避免追入近期波动已经过大的股票。策略在尾盘买入并隔夜持有，
     # 如果最近振幅过大，通常更容易先触发止损而不是止盈。
@@ -277,11 +397,19 @@ def select_for_date(day: str | pd.Timestamp, params: StrategyParams) -> Selectio
     # 第一步先判断大盘环境。大盘不过关时直接返回空选股，避免在弱市场里硬选。
     market = market_tail_rules(day_ts, params)
     market_ok = all(r.passed for r in market) if params.require_market_up else True
+    if not market_ok:
+        return SelectionResponse(
+            trade_date=str(day_ts.date()),
+            benchmark_code=settings.benchmark_code,
+            market_rules=market,
+            total_candidates=0,
+            selected=[],
+        )
 
     # 第二步做日线条件过滤，得到基础候选池。
     screened, base_count = daily_screen(day_ts, params)
     selected: list[SelectedStock] = []
-    if market_ok and not screened.empty:
+    if not screened.empty:
         # 第三步逐只股票做趋势和尾盘分时检查。分钟数据是按股票单文件读取的，
         # 所以只有经过日线过滤的少量候选才进入这里，避免全市场分钟数据扫描过慢。
         for _, row in screened.iterrows():
@@ -294,7 +422,7 @@ def select_for_date(day: str | pd.Timestamp, params: StrategyParams) -> Selectio
                 rule("量比不过热", row["volume_ratio"] <= params.max_volume_ratio, row["volume_ratio"], f"<= {params.max_volume_ratio}"),
                 rule("近期出现涨停", True, "yes", f"近{params.limitup_lookback}日 pct_chg>=9.9%"),
             ]
-            trend = trend_rules(code, day_ts, params)
+            trend = trend_rules(code, day_ts, params, float(row["close"]))
             intraday, metrics = stock_tail_metrics(code, day_ts, params)
             all_rules = rules + trend + intraday
             if (not params.require_intraday_checks or all(r.passed for r in trend + intraday)):

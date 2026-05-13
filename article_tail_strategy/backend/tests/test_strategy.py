@@ -44,6 +44,7 @@ def test_params_match_article_defaults():
     assert p.max_amplitude == 4
     assert p.limitup_lookback == 20
     assert p.require_index_above_ma20 is True
+    assert p.decision_time == "14:50"
     assert p.min_market_tail_return_pct == 0.05
     assert p.min_tail_return_pct == 0.20
     assert p.min_close_vs_vwap_pct == 0.10
@@ -83,7 +84,7 @@ def test_daily_screen_applies_article_five_conditions(monkeypatch):
         "turnover_rate": [3.5, 3.5, 2.0, 3.5],
         "volume_ratio": [1.3, 1.3, 1.3, 1.3],
         "circ_mv": [700_000, 700_000, 700_000, 700_000],
-        "is_st": [False, False, False, False],
+        "is_st": [False, False, False, True],
         "listed_days": [200, 200, 200, 200],
         "suspend_type": ["N", "N", "N", "N"],
     })
@@ -95,10 +96,22 @@ def test_daily_screen_applies_article_five_conditions(monkeypatch):
         "list_status": ["L", "L", "L", "L"],
     })
     hist = pd.DataFrame({"ts_code": ["A.SZ", "D.SZ"], "pct_chg": [10.0, 10.0]})
+    volume_hist = pd.DataFrame({"ts_code": ["A.SZ", "D.SZ"], "vol": [1_520_000, 1_520_000]})
     monkeypatch.setattr("app.services.strategy.load_daily_date", lambda day: raw)
     monkeypatch.setattr("app.services.data.load_basic", lambda: basic)
-    monkeypatch.setattr("app.services.strategy.load_daily_range", lambda start, end, cols: hist)
-    monkeypatch.setattr("app.services.strategy.previous_trading_dates", lambda day, n: [pd.Timestamp("2026-04-01")])
+    monkeypatch.setattr("app.services.strategy.load_daily_range", lambda start, end, cols: volume_hist if cols == ["vol"] else hist)
+    current_bars = pd.DataFrame({
+        "trade_time": pd.to_datetime(["2026-04-24 14:15", "2026-04-24 14:30"]),
+        "high": [10.2, 10.3],
+        "low": [10.0, 10.0],
+        "close": [10.1, 10.2],
+        "vol": [12_000_000, 12_500_000],
+        "amount": [1, 1],
+    })
+    monkeypatch.setattr("app.services.strategy.load_stock_minutes_for_codes_day", lambda codes, day, freq: pd.DataFrame())
+    monkeypatch.setattr("app.services.strategy.load_stock_minutes_for_day", lambda day, freq: pd.DataFrame())
+    monkeypatch.setattr("app.services.strategy.load_stock_minutes", lambda code, day, freq: current_bars)
+    monkeypatch.setattr("app.services.strategy.previous_trading_dates", lambda day, n, include_current=True: [pd.Timestamp("2026-04-01")])
 
     result, base_count = daily_screen("2026-04-24", StrategyParams())
 
@@ -280,15 +293,15 @@ def test_market_filter_flags_volume_crash_with_tail_drop(monkeypatch):
             "2026-04-24 11:00", "2026-04-24 13:00", "2026-04-24 14:30",
             "2026-04-24 14:45", "2026-04-24 15:00",
         ]),
-        "open": [100, 99.8, 99.6, 99.5, 99.4, 99.3, 99.2, 99.1, 98.9, 98.5, 98.3],
+        "open": [100, 99.8, 99.6, 99.5, 99.4, 99.3, 99.2, 98.8, 98.3, 98.5, 98.3],
         "high": [100.1] * 11,
         "low": [98.0] * 11,
-        "close": [99.8, 99.7, 99.6, 99.5, 99.4, 99.3, 99.2, 99.1, 98.9, 98.5, 98.2],
-        "vol": [100] * 8 + [200, 220, 240],
+        "close": [99.8, 99.7, 99.6, 99.5, 99.4, 99.3, 99.2, 98.8, 98.2, 98.5, 98.2],
+        "vol": [100] * 6 + [200, 220, 240, 220, 240],
         "amount": [1] * 11,
     })
     monkeypatch.setattr("app.services.strategy.load_index_minutes", lambda code, day, freq: bars)
-    monkeypatch.setattr("app.services.strategy.previous_trading_dates", lambda day, n: list(pd.date_range("2026-03-26", periods=22)))
+    monkeypatch.setattr("app.services.strategy.previous_trading_dates", lambda day, n, include_current=True: list(pd.date_range("2026-03-26", periods=22)))
     monkeypatch.setattr(
         "app.services.strategy.load_index_daily",
         lambda code, start, end: pd.DataFrame({
@@ -301,9 +314,9 @@ def test_market_filter_flags_volume_crash_with_tail_drop(monkeypatch):
     crash_rule = next(r for r in rules if r.name == "大盘未放量大跌")
 
     assert crash_rule.passed is False
-    assert "day=-1.80%" in crash_rule.actual
-    assert "tail=-0.71%" in crash_rule.actual
-    assert "tail_vol_ratio=2.20" in crash_rule.actual
+    assert "day=-1.50%" in crash_rule.actual
+    assert "tail=-0.30%" in crash_rule.actual
+    assert "tail_vol_ratio=1.98" in crash_rule.actual
 
 
 def test_market_filter_does_not_flag_without_tail_volume_expansion(monkeypatch):
@@ -322,7 +335,7 @@ def test_market_filter_does_not_flag_without_tail_volume_expansion(monkeypatch):
         "amount": [1] * 11,
     })
     monkeypatch.setattr("app.services.strategy.load_index_minutes", lambda code, day, freq: bars)
-    monkeypatch.setattr("app.services.strategy.previous_trading_dates", lambda day, n: list(pd.date_range("2026-03-26", periods=22)))
+    monkeypatch.setattr("app.services.strategy.previous_trading_dates", lambda day, n, include_current=True: list(pd.date_range("2026-03-26", periods=22)))
     monkeypatch.setattr(
         "app.services.strategy.load_index_daily",
         lambda code, start, end: pd.DataFrame({
@@ -378,7 +391,7 @@ def test_tail_metrics_rejects_weak_tail_bounce(monkeypatch):
     monkeypatch.setattr("app.services.strategy.load_stock_minutes", lambda code, day, freq: bars)
 
     rules, metrics = stock_tail_metrics("A.SZ", "2026-04-24", StrategyParams())
-    tail_rule = next(r for r in rules if r.name == "个股14:30后分时有效上升")
+    tail_rule = next(r for r in rules if r.name == "个股截至14:50分时有效上升")
 
     assert tail_rule.passed is False
     assert metrics["tail_return_pct"] < StrategyParams().min_tail_return_pct

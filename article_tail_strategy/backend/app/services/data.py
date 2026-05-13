@@ -4,6 +4,9 @@ from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
 
 from app.config import settings
 from app.models import DataInfo, MinuteBar
@@ -169,6 +172,7 @@ def load_daily_for_codes(start: str, end: str, codes: list[str]) -> pd.DataFrame
     return df
 
 
+@lru_cache(maxsize=50000)
 def load_stock_minutes(code: str, day: str | pd.Timestamp, freq: str = "15min") -> pd.DataFrame:
     """读取单只股票某一天的分钟线。
 
@@ -197,6 +201,52 @@ def load_stock_minutes(code: str, day: str | pd.Timestamp, freq: str = "15min") 
     return df.sort_values("trade_time")
 
 
+@lru_cache(maxsize=16)
+def load_stock_minutes_for_day(day: str | pd.Timestamp, freq: str = "15min") -> pd.DataFrame:
+    """读取某个交易日的全市场分钟线，用于批量选股快照。"""
+    path = market_dir() / f"stock_{freq}"
+    if not path.exists():
+        return pd.DataFrame()
+    day_ts = pd.Timestamp(day).normalize()
+    dataset = ds.dataset(str(path), format="parquet")
+    table = dataset.to_table(
+        columns=["__filename", "trade_date", "trade_time", "high", "low", "close", "vol", "amount"],
+        filter=pc.equal(pc.field("trade_date"), pa.scalar(day_ts.to_datetime64())),
+    )
+    if table.num_rows == 0:
+        return pd.DataFrame()
+    df = table.to_pandas().reset_index()
+    df["ts_code"] = df["__filename"].map(lambda value: Path(str(value)).stem)
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df["trade_time"] = pd.to_datetime(df["trade_time"])
+    return df.drop(columns=["__filename"]).sort_values(["ts_code", "trade_time"])
+
+
+def load_stock_minutes_for_codes_day(codes: tuple[str, ...], day: str | pd.Timestamp, freq: str = "15min") -> pd.DataFrame:
+    """批量读取指定股票集合在某个交易日的分钟线。"""
+    if not codes:
+        return pd.DataFrame()
+    minute_dir = market_dir() / f"stock_{freq}"
+    files = [minute_dir / f"{code}.parquet" for code in codes]
+    files = [str(path) for path in files if path.exists()]
+    if not files:
+        return pd.DataFrame()
+    day_ts = pd.Timestamp(day).normalize()
+    dataset = ds.dataset(files, format="parquet")
+    table = dataset.to_table(
+        columns=["__filename", "trade_date", "trade_time", "high", "low", "close", "vol", "amount"],
+        filter=pc.equal(pc.field("trade_date"), pa.scalar(day_ts.to_datetime64())),
+    )
+    if table.num_rows == 0:
+        return pd.DataFrame()
+    df = table.to_pandas().reset_index()
+    df["ts_code"] = df["__filename"].map(lambda value: Path(str(value)).stem)
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df["trade_time"] = pd.to_datetime(df["trade_time"])
+    return df.drop(columns=["__filename"]).sort_values(["ts_code", "trade_time"])
+
+
+@lru_cache(maxsize=2000)
 def load_index_minutes(code: str, day: str | pd.Timestamp, freq: str = "15min") -> pd.DataFrame:
     """读取指数某一天的分钟线，通常是沪深300。
 
@@ -235,11 +285,11 @@ def load_index_daily(code: str, start: str, end: str) -> pd.DataFrame:
     return df.loc[mask].sort_values("trade_date")
 
 
-def previous_trading_dates(day: str | pd.Timestamp, n: int) -> list[pd.Timestamp]:
-    """返回包含指定日期在内的最近若干个交易日。"""
+def previous_trading_dates(day: str | pd.Timestamp, n: int, include_current: bool = True) -> list[pd.Timestamp]:
+    """返回指定日期附近的最近若干个交易日。"""
     day_ts = pd.Timestamp(day).normalize()
     days = trading_days()
-    past = days[days <= day_ts]
+    past = days[days <= day_ts] if include_current else days[days < day_ts]
     return list(past[-n:])
 
 

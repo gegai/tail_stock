@@ -44,3 +44,6 @@ def test_optimization_record_round_trip(tmp_path, monkeypatch):
     assert listed[0].status == "error"
     assert listed[0].completed == 1
     assert listed[0].best_annualized_return == 0.8
+
+    optimization_records.delete_optimization_record(record.id)
+    assert optimization_records.list_optimization_records() == []

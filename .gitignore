@@ -37,3 +37,4 @@ data_cache/
 # OS
 .DS_Store
 Thumbs.db
+article_tail_strategy/backend/storage/

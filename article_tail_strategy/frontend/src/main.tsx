@@ -39,6 +39,7 @@ import {
   TradeRecord,
   cancelOptimization,
   deleteBacktestRecord,
+  deleteOptimizationRecord,
   getBacktestRecord,
   getBacktestProgress,
   getBacktestRecords,
@@ -67,6 +68,7 @@ const defaultStrategy: StrategyParams = {
   require_market_up: true,
   require_intraday_checks: true,
   require_index_above_ma20: true,
+  decision_time: "14:50",
   min_market_tail_return_pct: 0.05,
   min_tail_return_pct: 0.2,
   min_close_vs_vwap_pct: 0.1,
@@ -127,6 +129,7 @@ function parseNumberList(value: unknown, fallback: number[]) {
 function formatParamSummary(params: Record<string, unknown>) {
   const labels: Record<string, string> = {
     max_float_mktcap: "市值",
+    decision_time: "决策时间",
     max_amplitude: "振幅",
     max_volume_ratio: "量比上限",
     min_market_tail_return_pct: "大盘尾盘",
@@ -169,6 +172,7 @@ const backtestParamLabels: Array<[keyof BacktestParams, string, (value: unknown)
   ["max_positions", "最大持仓数", String],
   ["enable_trend_exit", "趋势走坏卖出", (v) => (v ? "开启" : "关闭")],
   ["require_index_above_ma20", "大盘 MA20 过滤", (v) => (v ? "开启" : "关闭")],
+  ["decision_time", "选股决策时间", String],
   ["commission_rate", "手续费", (v) => `${(Number(v) * 10000).toFixed(2)} BP`]
 ];
 
@@ -419,6 +423,7 @@ function StrategyForm({
         <Col span={12}><Form.Item label="尾盘放量倍数" name="tail_volume_multiplier"><InputNumber min={0} step={0.1} /></Form.Item></Col>
         <Col span={12}><Form.Item label="近期振幅上限(%)" name="max_recent_amplitude_pct"><InputNumber min={0} step={0.5} /></Form.Item></Col>
         <Col span={12}><Form.Item label="振幅回看日" name="recent_amplitude_lookback"><InputNumber min={2} max={20} /></Form.Item></Col>
+        <Col span={12}><Form.Item label="选股决策时间" name="decision_time"><Input /></Form.Item></Col>
         <Col span={12}><Form.Item label="大盘MA20过滤" name="require_index_above_ma20" valuePropName="checked"><Switch /></Form.Item></Col>
       </Row>
       {backtest && (
@@ -453,6 +458,7 @@ function toStrategy(values: Record<string, unknown>): StrategyParams {
     max_amplitude: Number(values.max_amplitude),
     limitup_lookback: Number(values.limitup_lookback),
     require_index_above_ma20: Boolean(values.require_index_above_ma20),
+    decision_time: String(values.decision_time || defaultStrategy.decision_time),
     min_market_tail_return_pct: Number(values.min_market_tail_return_pct),
     min_tail_return_pct: Number(values.min_tail_return_pct),
     min_close_vs_vwap_pct: Number(values.min_close_vs_vwap_pct),
@@ -843,6 +849,19 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
     }
   }
 
+  async function removeOptimizationRecord(recordId: string) {
+    setError("");
+    try {
+      await deleteOptimizationRecord(recordId);
+      if (progress?.job_id === recordId) {
+        setProgress(null);
+      }
+      await refreshOptimizationRecords();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "删除参数优化记录失败");
+    }
+  }
+
   async function submit(values: Record<string, unknown>) {
     setError("");
     setProgress(null);
@@ -879,7 +898,6 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
         ranges,
         max_workers: Number(values.max_workers),
         max_combinations: Number(values.max_combinations),
-        min_trade_count: Number(values.min_trade_count),
         max_drawdown_limit: Number(values.max_drawdown_limit) / 100,
         top_n: Number(values.top_n)
       });
@@ -916,6 +934,7 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
               max_position_pct: 30,
               max_trade_loss_pct: 5,
               market_tail_weak_pct: -0.3,
+              decision_time: defaultStrategy.decision_time,
               trend_break_ma_window: 5,
               trend_exit_after_days: 3,
               max_hold_days: 5,
@@ -930,7 +949,6 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
               max_positions_values: "2,3,4",
               max_workers: 10,
               max_combinations: 6000,
-              min_trade_count: 80,
               max_drawdown_limit: -20,
               top_n: 20
             }}
@@ -959,7 +977,6 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
             <Row gutter={8}>
               <Col span={12}><Form.Item label="并行进程" name="max_workers"><InputNumber min={1} max={12} /></Form.Item></Col>
               <Col span={12}><Form.Item label="组合上限" name="max_combinations"><InputNumber min={1} max={10000} /></Form.Item></Col>
-              <Col span={12}><Form.Item label="交易数目标" name="min_trade_count"><InputNumber min={0} /></Form.Item></Col>
               <Col span={12}><Form.Item label="回撤红线(%)" name="max_drawdown_limit"><InputNumber max={0} /></Form.Item></Col>
               <Col span={12}><Form.Item label="展示前N名" name="top_n"><InputNumber min={1} max={100} /></Form.Item></Col>
             </Row>
@@ -997,6 +1014,16 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
                       <Button size="small" onClick={() => continueOptimization(r.id)} disabled={loading || r.status === "done"}>
                         继续
                       </Button>
+                      <Popconfirm
+                        title="删除这条参数优化记录？"
+                        okText="删除"
+                        cancelText="取消"
+                        onConfirm={() => removeOptimizationRecord(r.id)}
+                      >
+                        <Button size="small" danger disabled={r.status === "queued" || r.status === "running"}>
+                          删除
+                        </Button>
+                      </Popconfirm>
                     </Space>
                   )
                 }

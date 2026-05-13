@@ -20,6 +20,7 @@ class StrategyParams(BaseModel):
     require_market_up: bool = True
     require_intraday_checks: bool = True
     require_index_above_ma20: bool = True
+    decision_time: str = Field(default="14:50", pattern=r"^\d{2}:\d{2}$", description="选股决策时间，HH:MM")
     min_market_tail_return_pct: float = Field(default=0.05, ge=0, description="大盘14:30后最低涨幅，%")
     min_tail_return_pct: float = Field(default=0.20, ge=0, description="个股14:30后最低涨幅，%")
     min_close_vs_vwap_pct: float = Field(default=0.10, ge=0, description="收盘价高于均价线的最低幅度，%")
@@ -188,7 +189,6 @@ class OptimizationParams(BaseModel):
     ranges: list[SweepRange]
     max_workers: int = Field(default=6, ge=1, le=12)
     max_combinations: int = Field(default=6000, ge=1, le=10000)
-    min_trade_count: int = Field(default=80, ge=0)
     max_drawdown_limit: float = Field(default=-0.20, le=0)
     top_n: int = Field(default=20, ge=1, le=100)
 
