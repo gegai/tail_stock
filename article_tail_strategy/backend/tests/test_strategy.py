@@ -25,7 +25,12 @@ def test_sell_next_day_returns_trigger_time(monkeypatch):
         "low": [9.9, 10.2],
         "close": [10.05, 10.4],
     })
-    monkeypatch.setattr("app.services.backtest.load_stock_minutes", lambda code, day, freq: bars)
+    seen_freqs = []
+    def fake_load_stock_minutes(code, day, freq):
+        seen_freqs.append(freq)
+        return bars
+
+    monkeypatch.setattr("app.services.backtest.load_stock_minutes", fake_load_stock_minutes)
     params = BacktestParams(start_date=date(2026, 4, 1), end_date=date(2026, 4, 24), take_profit_pct=3)
 
     price, reason, sell_time = _sell_next_day("A.SZ", pd.Timestamp("2026-04-25"), 10.0, params)
@@ -33,6 +38,7 @@ def test_sell_next_day_returns_trigger_time(monkeypatch):
     assert price == 10.3
     assert reason == "take_profit"
     assert sell_time == "09:45"
+    assert seen_freqs == ["1min"]
 
 
 def test_params_match_article_defaults():

@@ -4,3 +4,4 @@
 /desktop/dist/
 /desktop/node_modules/
 /desktop/resources/
+*.log

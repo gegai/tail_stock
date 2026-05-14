@@ -51,6 +51,7 @@ import {
   getStockWindow,
   resumeOptimization,
   runSelection,
+  runTushareSelection,
   startBacktest,
   startOptimization
 } from "./api";
@@ -217,15 +218,53 @@ function buildDefaultBacktestParams(startDate: string, endDate: string): Backtes
   };
 }
 
-function stockDetailUrl(code: string, name: string, centerDate: string) {
+function stockDetailUrl(code: string, name: string, centerDate: string, trade?: TradeRecord) {
   const params = new URLSearchParams({ code, name, date: centerDate });
+  if (trade) {
+    params.set("buy_date", trade.buy_date);
+    params.set("buy_time", trade.buy_time);
+    params.set("buy_price", String(trade.buy_price));
+    params.set("sell_date", trade.sell_date);
+    params.set("sell_time", trade.sell_time);
+    params.set("sell_price", String(trade.sell_price));
+  }
   return `/stock-detail?${params.toString()}`;
 }
 
-function buildMinuteOption(title: string, bars: { dt: string; close: number; vwap: number; vol: number }[]) {
+type TradeMarker = { name: string; time: string; price: number; color: string };
+
+function buildMinuteOption(title: string, bars: { dt: string; open?: number; close: number; vwap: number; vol: number }[], markers: TradeMarker[] = []) {
+  const basePrice = bars[0]?.open || bars[0]?.close || 0;
+  const markerData = markers.map((marker) => ({
+    name: marker.name,
+    coord: [marker.time.slice(0, 5), marker.price],
+    value: marker.price,
+    itemStyle: { color: marker.color },
+    label: { formatter: marker.name }
+  }));
   return {
     title: { text: title, left: 8, textStyle: { fontSize: 13 } },
-    tooltip: { trigger: "axis" },
+    tooltip: {
+      trigger: "axis",
+      formatter: (params: unknown) => {
+        const items = Array.isArray(params) ? params : [params];
+        const first = items[0] as { dataIndex?: number; axisValue?: string } | undefined;
+        const index = first?.dataIndex ?? 0;
+        const bar = bars[index];
+        if (!bar) return "";
+        const change = basePrice ? bar.close - basePrice : 0;
+        const changePct = basePrice ? (change / basePrice) * 100 : 0;
+        const color = change >= 0 ? "#f5222d" : "#52c41a";
+        const lines = [
+          `${bar.dt.slice(0, 16)}`,
+          `价格：${bar.close.toFixed(4)}`,
+          `均价：${bar.vwap.toFixed(4)}`,
+          `<span style="color:${color}">涨跌：${change >= 0 ? "+" : ""}${change.toFixed(4)} (${changePct >= 0 ? "+" : ""}${changePct.toFixed(2)}%)</span>`,
+          `成交量：${bar.vol.toLocaleString()}`
+        ];
+        return lines.join("<br/>");
+      }
+    },
     legend: { data: ["收盘", "均价线", "成交量"], top: 24 },
     grid: [
       { left: 54, right: 18, top: 58, height: 145 },
@@ -241,7 +280,7 @@ function buildMinuteOption(title: string, bars: { dt: string; close: number; vwa
     ],
     dataZoom: [{ type: "inside", xAxisIndex: [0, 1] }],
     series: [
-      { name: "收盘", type: "line", data: bars.map((b) => b.close), symbol: "none" },
+      { name: "收盘", type: "line", data: bars.map((b) => b.close), symbol: "none", markPoint: markerData.length ? { data: markerData } : undefined },
       { name: "均价线", type: "line", data: bars.map((b) => b.vwap), symbol: "none" },
       { name: "成交量", type: "bar", xAxisIndex: 1, yAxisIndex: 1, data: bars.map((b) => b.vol), itemStyle: { color: "#8c8c8c" } }
     ]
@@ -359,30 +398,41 @@ function StrategyForm({
   onFinish,
   backtest = false,
   loading = false,
-  initialBacktestParams = null
+  initialBacktestParams = null,
+  initialStrategyParams = null
 }: {
   onFinish: (values: Record<string, unknown>) => void;
   backtest?: boolean;
   loading?: boolean;
   initialBacktestParams?: BacktestParams | null;
+  initialStrategyParams?: Partial<BacktestParams> | null;
 }) {
   const [form] = Form.useForm();
+  // 回测/选股表单默认值说明：
+  // - 策略过滤参数来自 defaultStrategy，保持和后端 StrategyParams 默认口径一致。
+  // - 页面里仓位使用百分数展示和输入，因此 max_position_pct 这里是 30，提交时再除以 100。
+  // - commission_rate 这里使用 BP 输入，因此 10 表示 10BP，提交时再除以 10000。
+  // - 如果从参数优化结果跳转过来，initialBacktestParams 会覆盖这些默认值。
   const initialValues = {
     ...defaultStrategy,
-    trade_date: dayjs("2026-04-24"),
+    trade_date: dayjs("2026-05-08"),
     start_date: dayjs("2025-01-01"),
-    end_date: dayjs("2026-04-24"),
+    end_date: dayjs("2026-05-08"),
     initial_capital: 100000,
-    max_position_pct: 30,
-    take_profit_pct: 5,
+    max_position_pct: 100,
+    take_profit_pct: 6,
     stop_loss_pct: 5,
     max_trade_loss_pct: 5,
     market_tail_weak_pct: -0.3,
     trend_break_ma_window: 5,
     trend_exit_after_days: 3,
-    max_hold_days: 5,
+    max_hold_days: 1,
     enable_trend_exit: true,
-    commission_rate: 10,
+    commission_rate: 6,
+    ...(!backtest && initialStrategyParams ? {
+      ...initialStrategyParams,
+      trade_date: dayjs(initialStrategyParams.end_date || "2026-04-24")
+    } : {}),
     ...(backtest && initialBacktestParams ? backtestParamsToFormValues(initialBacktestParams) : {})
   };
 
@@ -390,7 +440,13 @@ function StrategyForm({
     if (backtest && initialBacktestParams) {
       form.setFieldsValue(backtestParamsToFormValues(initialBacktestParams));
     }
-  }, [backtest, form, initialBacktestParams]);
+    if (!backtest && initialStrategyParams) {
+      form.setFieldsValue({
+        ...initialStrategyParams,
+        trade_date: dayjs(initialStrategyParams.end_date || "2026-04-24")
+      });
+    }
+  }, [backtest, form, initialBacktestParams, initialStrategyParams]);
 
   return (
     <Form
@@ -470,19 +526,27 @@ function toStrategy(values: Record<string, unknown>): StrategyParams {
   };
 }
 
-function SelectionPanel() {
+function SelectionPanel({ initialParams }: { initialParams: Partial<BacktestParams> | null }) {
   const [result, setResult] = useState<Awaited<ReturnType<typeof runSelection>> | null>(null);
   const [minuteOption, setMinuteOption] = useState<object | null>(null);
+  const [marketOption, setMarketOption] = useState<object | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [useTushare, setUseTushare] = useState(false);
 
   async function submit(values: Record<string, unknown>) {
     setError("");
     setMinuteOption(null);
+    setMarketOption(null);
     setLoading(true);
     try {
       const tradeDate = (values.trade_date as Dayjs).format("YYYY-MM-DD");
-      setResult(await runSelection(tradeDate, toStrategy(values)));
+      const next = useTushare
+        ? await runTushareSelection(tradeDate, toStrategy(values))
+        : await runSelection(tradeDate, toStrategy(values));
+      setResult(next);
+      const market = await getMinuteDetail("大盘", tradeDate, "index");
+      setMarketOption(buildMinuteOption("沪深300", market.bars));
     } catch (e) {
       setError(e instanceof Error ? e.message : "选股失败");
     } finally {
@@ -492,29 +556,46 @@ function SelectionPanel() {
 
   async function showMinute(stock: SelectedStock) {
     const data = await getMinute(stock.code, stock.trade_date);
-    setMinuteOption({
-      tooltip: { trigger: "axis" },
-      legend: { data: ["收盘", "均价线"] },
-      xAxis: { type: "category", data: data.bars.map((b) => b.dt.slice(11, 16)) },
-      yAxis: { type: "value", scale: true },
-      series: [
-        { name: "收盘", type: "line", data: data.bars.map((b) => b.close) },
-        { name: "均价线", type: "line", data: data.bars.map((b) => b.vwap) }
-      ]
-    });
+    setMinuteOption(buildMinuteOption(`${stock.name} ${stock.code}`, data.bars));
   }
 
   return (
     <Row gutter={16}>
-      <Col span={6}><Card size="small" title="文章策略参数"><StrategyForm onFinish={submit} loading={loading} /></Card></Col>
+      <Col span={6}>
+        <Card size="small" title="文章策略参数">
+          <Space orientation="vertical" style={{ width: "100%" }}>
+            <Space>
+              <Switch checked={useTushare} onChange={setUseTushare} />
+              <Text>真实选股(Tushare)</Text>
+            </Space>
+            <Text type="secondary">开启后会读取 Tushare 行情快照，并在结果里显示大盘和入选股票详情。</Text>
+            <StrategyForm onFinish={submit} loading={loading} initialStrategyParams={initialParams} />
+          </Space>
+        </Card>
+      </Col>
       <Col span={18}>
         <Space orientation="vertical" style={{ width: "100%" }}>
           {error && <Alert type="error" message={error} />}
+          {marketOption && <Card size="small" title="大盘分时"><ReactECharts option={marketOption} style={{ height: 300 }} /></Card>}
           {result && (
             <Card size="small" title={`${result.trade_date} 选股结果`}>
               <Space orientation="vertical" style={{ width: "100%" }}>
                 <RuleTags rules={result.market_rules} />
-                <Text type="secondary">基础候选池：{result.total_candidates}，最终入选：{result.selected.length}</Text>
+                <Text type="secondary">数据源：{result.source === "tushare" ? "Tushare真实行情" : "本地历史数据"}，基础候选池：{result.total_candidates}，最终入选：{result.selected.length}</Text>
+                {result.market_quote && (
+                  <Descriptions bordered size="small" column={4}>
+                    <Descriptions.Item label="大盘">{result.market_quote.name || result.market_quote.ts_code}</Descriptions.Item>
+                    <Descriptions.Item label="现价">{result.market_quote.price ?? "-"}</Descriptions.Item>
+                    <Descriptions.Item label="涨跌幅">{result.market_quote.pct_chg == null ? "-" : `${result.market_quote.pct_chg.toFixed(2)}%`}</Descriptions.Item>
+                    <Descriptions.Item label="时间">{result.market_quote.trade_time || "-"}</Descriptions.Item>
+                  </Descriptions>
+                )}
+                <Alert
+                  type="info"
+                  showIcon
+                  message="策略买卖"
+                  description="入选股票按决策价制定买入计划；卖出沿用回测中的止盈、止损、单笔最大亏损、大盘尾盘走弱、趋势走坏和到期卖出规则。"
+                />
                 <Table<SelectedStock>
                   size="small"
                   rowKey="code"
@@ -537,6 +618,14 @@ function SelectionPanel() {
                     { title: "换手", dataIndex: "turnover_rate" },
                     { title: "量比", dataIndex: "volume_ratio" },
                     { title: "尾盘涨幅", dataIndex: "tail_return_pct" },
+                    {
+                      title: "实时价",
+                      render: (_, r) => result.selected_quotes.find((q) => q.ts_code === r.code)?.price ?? "-"
+                    },
+                    {
+                      title: "交易计划",
+                      render: (_, r) => `买入:${r.buy_price ?? "-"} / 按策略卖出`
+                    },
                     { title: "操作", render: (_, r) => <Button size="small" onClick={() => showMinute(r)}>分时</Button> }
                   ]}
                 />
@@ -721,15 +810,16 @@ function BacktestPanel({ initialParams }: { initialParams: BacktestParams | null
                   {
                     title: "代码",
                     dataIndex: "code",
-                    render: (_, r) => <a href={stockDetailUrl(r.code, r.name, r.buy_date)} target="_blank" rel="noreferrer">{r.code}</a>
+                    render: (_, r) => <a href={stockDetailUrl(r.code, r.name, r.buy_date, r)} target="_blank" rel="noreferrer">{r.code}</a>
                   },
                   {
                     title: "名称",
                     dataIndex: "name",
-                    render: (_, r) => <a href={stockDetailUrl(r.code, r.name, r.buy_date)} target="_blank" rel="noreferrer">{r.name}</a>
+                    render: (_, r) => <a href={stockDetailUrl(r.code, r.name, r.buy_date, r)} target="_blank" rel="noreferrer">{r.name}</a>
                   },
                   { title: "买价", dataIndex: "buy_price" },
                   { title: "卖价", dataIndex: "sell_price" },
+                  { title: "买入手数", render: (_, r) => Math.floor(r.shares / 100) },
                   { title: "收益率%", dataIndex: "return_pct" },
                   { title: "利润", dataIndex: "profit" },
                   { title: "退出", dataIndex: "exit_reason", render: (reason: string) => exitReasonText(reason) }
@@ -748,13 +838,19 @@ function StockDetailPage() {
   const code = query.get("code") || "";
   const name = query.get("name") || "";
   const centerDate = query.get("date") || dayjs().format("YYYY-MM-DD");
+  const buyDate = query.get("buy_date") || "";
+  const buyTime = query.get("buy_time") || "";
+  const buyPrice = Number(query.get("buy_price") || "");
+  const sellDate = query.get("sell_date") || "";
+  const sellTime = query.get("sell_time") || "";
+  const sellPrice = Number(query.get("sell_price") || "");
   const [data, setData] = useState<StockWindowResponse | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     setLoading(true);
-    getStockWindow(code, centerDate, name)
+    getStockWindow(code, centerDate, name, 1)
       .then(setData)
       .catch((e) => setError(e instanceof Error ? e.message : "股票分时加载失败"))
       .finally(() => setLoading(false));
@@ -763,7 +859,7 @@ function StockDetailPage() {
   return (
     <main>
       <Title level={3}>{name ? `${name} ${code}` : code}</Title>
-      <Text type="secondary">中心日期：{centerDate}，展示前后各5个交易日的1分钟分时图。</Text>
+      <Text type="secondary">中心日期：{centerDate}，只展示前后各1个交易日的1分钟分时图；买入点和卖出点会标在对应交易日上。</Text>
       <Space orientation="vertical" style={{ width: "100%", marginTop: 16 }} size={16}>
         {loading && <Card size="small"><Progress percent={60} status="active" /></Card>}
         {error && <Alert type="error" message={error} />}
@@ -774,7 +870,13 @@ function StockDetailPage() {
             title={`${day.trade_date}${day.trade_date === data.center_date ? " 买入日" : ""}`}
           >
             {day.bars.length ? (
-              <ReactECharts option={buildMinuteOption(day.trade_date, day.bars)} style={{ height: 315 }} />
+              <ReactECharts
+                option={buildMinuteOption(day.trade_date, day.bars, [
+                  ...(day.trade_date === buyDate && Number.isFinite(buyPrice) ? [{ name: "买入", time: buyTime || "14:50", price: buyPrice, color: "#1677ff" }] : []),
+                  ...(day.trade_date === sellDate && Number.isFinite(sellPrice) ? [{ name: "卖出", time: sellTime || "15:00", price: sellPrice, color: "#f5222d" }] : [])
+                ])}
+                style={{ height: 315 }}
+              />
             ) : (
               <Text type="secondary">当日没有分钟数据</Text>
             )}
@@ -785,7 +887,13 @@ function StockDetailPage() {
   );
 }
 
-function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: BacktestParams) => void }) {
+function OptimizationPanel({
+  onBacktestParams,
+  onSelectParams
+}: {
+  onBacktestParams: (params: BacktestParams) => void;
+  onSelectParams: (params: BacktestParams) => void;
+}) {
   const [progress, setProgress] = useState<OptimizationProgress | null>(null);
   const [records, setRecords] = useState<OptimizationRecordSummary[]>([]);
   const [error, setError] = useState("");
@@ -928,28 +1036,51 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
             layout="vertical"
             size="small"
             initialValues={{
+              // 回测开始日期。
               start_date: dayjs("2025-01-01"),
-              end_date: dayjs("2026-04-24"),
+              // 回测结束日期，默认使用当前本地数据最后一个交易日附近。
+              end_date: dayjs("2026-05-08"),
+              // 初始资金，单位元。
               initial_capital: 100000,
-              max_position_pct: 30,
+              // 单股最大仓位，页面用百分数输入；提交时会除以 100 转成 1.0。
+              max_position_pct: 100,
+              // 单笔最大亏损阈值，单位 %。
               max_trade_loss_pct: 5,
+              // 持仓期间大盘尾盘走弱阈值，单位 %。
               market_tail_weak_pct: -0.3,
+              // 选股决策时间，只允许使用该时点及以前的数据。
               decision_time: defaultStrategy.decision_time,
+              // 趋势走坏卖出使用的短均线窗口。
               trend_break_ma_window: 5,
+              // 持有满几天后开始启用趋势走坏卖出。
               trend_exit_after_days: 3,
-              max_hold_days: 5,
-              commission_rate: 10,
-              max_float_mktcap_values: "80,120,200",
-              max_amplitude_values: "4,4.5,5,6",
-              max_volume_ratio_values: "1.3,1.5,1.8,2.0",
-              min_market_tail_return_pct_values: "0,0.05,0.1",
-              min_tail_return_pct_values: "0.1,0.2,0.3",
-              take_profit_pct_values: "4,5,6,8",
-              stop_loss_pct_values: "4,5,6",
+              // 最大持有交易日数。
+              max_hold_days: 1,
+              // 手续费，单位 BP；提交时会除以 10000。
+              commission_rate: 6,
+              // 流通市值上限候选值，单位亿元，逗号分隔。
+              max_float_mktcap_values: "80,120",
+              // 截至决策时点的日内振幅上限候选值，单位 %。
+              max_amplitude_values: "4,4.5,5",
+              // 量比上限候选值，用来过滤过热股票。
+              max_volume_ratio_values: "1.3,1.5,1.8",
+              // 大盘尾盘涨幅下限候选值，单位 %。
+              min_market_tail_return_pct_values: "0,0.05",
+              // 个股尾盘涨幅下限候选值，单位 %。
+              min_tail_return_pct_values: "0.1,0.2",
+              // 止盈候选值，单位 %。
+              take_profit_pct_values: "4,5,6",
+              // 止损候选值，单位 %。
+              stop_loss_pct_values: "4,5",
+              // 同时最大持仓数候选值。
               max_positions_values: "2,3,4",
-              max_workers: 10,
-              max_combinations: 6000,
+              // 参数优化并行进程数。
+              max_workers: 8,
+              // 参数组合数量上限，避免一次任务过大。
+              max_combinations: 16000,
+              // 最大回撤过滤阈值，页面用百分数输入；提交时会除以 100。
               max_drawdown_limit: -20,
+              // 当前最优组合保留和展示的数量。
               top_n: 20
             }}
             onFinish={submit}
@@ -1020,7 +1151,7 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
                         cancelText="取消"
                         onConfirm={() => removeOptimizationRecord(r.id)}
                       >
-                        <Button size="small" danger disabled={r.status === "queued" || r.status === "running"}>
+                        <Button size="small" danger>
                           删除
                         </Button>
                       </Popconfirm>
@@ -1057,9 +1188,14 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
                 {
                   title: "操作",
                   render: (_, r) => (
-                    <Button size="small" onClick={() => onBacktestParams(r.params as unknown as BacktestParams)}>
-                      回测
-                    </Button>
+                    <Space>
+                      <Button size="small" onClick={() => onSelectParams(r.params as unknown as BacktestParams)}>
+                        选股
+                      </Button>
+                      <Button size="small" onClick={() => onBacktestParams(r.params as unknown as BacktestParams)}>
+                        回测
+                      </Button>
+                    </Space>
                   )
                 }
               ]}
@@ -1073,6 +1209,7 @@ function OptimizationPanel({ onBacktestParams }: { onBacktestParams: (params: Ba
 
 function App() {
   const [activeTab, setActiveTab] = useState("data");
+  const [selectionInitialParams, setSelectionInitialParams] = useState<Partial<BacktestParams> | null>(null);
   const [backtestInitialParams, setBacktestInitialParams] = useState<BacktestParams | null>(null);
 
   if (window.location.pathname === "/stock-detail") {
@@ -1084,15 +1221,20 @@ function App() {
     setActiveTab("backtest");
   }
 
+  function openSelectionWithParams(params: BacktestParams) {
+    setSelectionInitialParams(params);
+    setActiveTab("select");
+  }
+
   return (
     <main>
       <Title level={3}>文章版尾盘30分钟选股法</Title>
       <Text type="secondary">按原文拆成大盘过滤、日线五条件、尾盘分时确认、次日多条件卖出，并逐条展示规则。</Text>
       <Tabs activeKey={activeTab} onChange={setActiveTab} items={[
         { key: "data", label: "数据查看", children: <DataPanel /> },
-        { key: "select", label: "选股", children: <SelectionPanel /> },
+        { key: "select", label: "选股", children: <SelectionPanel initialParams={selectionInitialParams} /> },
         { key: "backtest", label: "回测", children: <BacktestPanel initialParams={backtestInitialParams} /> },
-        { key: "optimize", label: "参数优化", children: <OptimizationPanel onBacktestParams={openBacktestWithParams} /> }
+        { key: "optimize", label: "参数优化", children: <OptimizationPanel onBacktestParams={openBacktestWithParams} onSelectParams={openSelectionWithParams} /> }
       ]} />
     </main>
   );

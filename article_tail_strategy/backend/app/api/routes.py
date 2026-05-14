@@ -41,6 +41,7 @@ from app.services.optimization_records import (
 )
 from app.services.records import delete_backtest_record, list_backtest_records, load_backtest_record, save_backtest_record
 from app.services.strategy import select_for_date
+from app.services.tushare_live import TushareError, run_live_selection
 
 router = APIRouter()
 
@@ -81,6 +82,11 @@ def _save_opt_job(job: OptimizationProgress) -> None:
 def _get_opt_job(job_id: str) -> OptimizationProgress | None:
     with _opt_jobs_lock:
         return _opt_jobs.get(job_id)
+
+
+def _remove_opt_job(job_id: str) -> None:
+    with _opt_jobs_lock:
+        _opt_jobs.pop(job_id, None)
 
 
 def _persist_optimization_progress(job_id: str, progress: OptimizationProgress) -> None:
@@ -143,6 +149,20 @@ async def run_selection(
     """按文章规则执行某一个交易日的选股。"""
     try:
         return await run_in_threadpool(select_for_date, trade_date, params or StrategyParams())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/select/tushare/run", response_model=SelectionResponse)
+async def run_tushare_selection(
+    trade_date: date = Query(...),
+    params: StrategyParams | None = None,
+):
+    """使用 Tushare 行情快照运行真实选股，并返回大盘和入选股票的详细行情。"""
+    try:
+        return await run_in_threadpool(run_live_selection, str(trade_date), params or StrategyParams())
+    except TushareError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -359,9 +379,10 @@ async def get_optimization_record(record_id: str):
 @router.delete("/optimize/records/{record_id}")
 async def remove_optimization_record(record_id: str):
     """删除一条本地参数优化记录。"""
-    active = _get_opt_job(record_id)
-    if record_id in _opt_cancel_events or (active and active.status in {"queued", "running"}):
-        raise HTTPException(status_code=409, detail="参数优化任务仍在运行，请先取消或等待结束")
+    event = _opt_cancel_events.get(record_id)
+    if event is not None:
+        event.set()
+    _remove_opt_job(record_id)
     try:
         await run_in_threadpool(delete_optimization_record, record_id)
         return {"ok": True}
@@ -446,7 +467,7 @@ async def get_stock_minute(code: str, trade_date: date = Query(...)):
 async def get_stock_window(
     code: str,
     center_date: date = Query(...),
-    radius: int = Query(default=5, ge=1, le=20),
+    radius: int = Query(default=1, ge=1, le=20),
     freq: str = Query(default="1min", pattern="^(1min|5min|15min|30min|60min)$"),
     name: str | None = Query(default=None),
 ):

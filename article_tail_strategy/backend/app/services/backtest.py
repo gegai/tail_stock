@@ -18,6 +18,7 @@ from app.services.strategy import select_for_date
 # 服务层不依赖网页框架；接口层可以传入回调发布进度，测试和脚本也可以
 # 直接调用回测入口，不需要模拟网络请求环境。
 ProgressCallback = Callable[[int, str, str | None], None]
+BACKTEST_INTRADAY_FREQ = "1min"
 
 
 def _market_tail_is_weak(day: pd.Timestamp, params: BacktestParams) -> bool:
@@ -28,7 +29,7 @@ def _market_tail_is_weak(day: pd.Timestamp, params: BacktestParams) -> bool:
     已经可见后，才按收盘价执行防守性清仓。
     """
     # 卖出阶段也要看大盘尾盘。如果大盘 14:30 后继续走弱，就触发防守性清仓。
-    bars = load_index_minutes(settings.benchmark_code, day, "15min")
+    bars = load_index_minutes(settings.benchmark_code, day, BACKTEST_INTRADAY_FREQ)
     if bars.empty:
         return False
     times = pd.to_datetime(bars["trade_time"]).dt.strftime("%H:%M")
@@ -101,7 +102,7 @@ def _sell_holding_period(
 
     # 从买入日后的第一个交易日开始，最多观察参数规定的最大持有交易日数。
     for hold_day, day in enumerate(future_days, start=1):
-        bars = load_stock_minutes(code, day, "15min")
+        bars = load_stock_minutes(code, day, BACKTEST_INTRADAY_FREQ)
         if bars.empty:
             continue
 
@@ -141,7 +142,7 @@ def _sell_holding_period(
 
 def _sell_next_day(code: str, next_day: pd.Timestamp, buy_price: float, params: BacktestParams) -> tuple[float, str, str]:
     """兼容旧版 T+1 卖出测试的辅助函数。"""
-    bars = load_stock_minutes(code, next_day, "15min")
+    bars = load_stock_minutes(code, next_day, BACKTEST_INTRADAY_FREQ)
     if bars.empty:
         return buy_price, "no_next_day", "N/A"
 
@@ -185,7 +186,7 @@ def _shares_for(allocation: float, price: float) -> int:
 
 def _close_price_on_day(code: str, day: pd.Timestamp, fallback: float) -> float:
     """返回某只股票当天最后一根分钟线收盘价，用于每日盯市。"""
-    bars = load_stock_minutes(code, day, "15min")
+    bars = load_stock_minutes(code, day, BACKTEST_INTRADAY_FREQ)
     if bars.empty:
         return fallback
     return float(bars.iloc[-1]["close"])

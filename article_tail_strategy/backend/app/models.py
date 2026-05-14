@@ -82,6 +82,24 @@ class SelectedStock(BaseModel):
     tail_volume_ratio: float | None = None
 
 
+class TushareQuote(BaseModel):
+    """Tushare 返回的行情快照。
+
+    字段保持宽松，避免不同 Tushare 接口返回列不完全一致时破坏选股流程。
+    """
+    ts_code: str
+    name: str | None = None
+    price: float | None = None
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    pre_close: float | None = None
+    volume: float | None = None
+    amount: float | None = None
+    pct_chg: float | None = None
+    trade_time: str | None = None
+
+
 class SelectionResponse(BaseModel):
     """单日选股接口响应。"""
     trade_date: str
@@ -89,6 +107,9 @@ class SelectionResponse(BaseModel):
     market_rules: list[RuleResult]
     total_candidates: int
     selected: list[SelectedStock]
+    source: str = "local"
+    market_quote: TushareQuote | None = None
+    selected_quotes: list[TushareQuote] = Field(default_factory=list)
 
 
 class TradeRecord(BaseModel):

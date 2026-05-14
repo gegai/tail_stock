@@ -72,6 +72,23 @@ export interface SelectionResponse {
   market_rules: RuleResult[];
   total_candidates: number;
   selected: SelectedStock[];
+  source: "local" | "tushare";
+  market_quote: TushareQuote | null;
+  selected_quotes: TushareQuote[];
+}
+
+export interface TushareQuote {
+  ts_code: string;
+  name: string | null;
+  price: number | null;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  pre_close: number | null;
+  volume: number | null;
+  amount: number | null;
+  pct_chg: number | null;
+  trade_time: string | null;
 }
 
 export interface DataInfo {
@@ -239,6 +256,10 @@ export async function runSelection(tradeDate: string, params: StrategyParams) {
   return (await api.post<SelectionResponse>(`/api/select/run?trade_date=${tradeDate}`, params)).data;
 }
 
+export async function runTushareSelection(tradeDate: string, params: StrategyParams) {
+  return (await api.post<SelectionResponse>(`/api/select/tushare/run?trade_date=${tradeDate}`, params)).data;
+}
+
 export async function runBacktest(params: BacktestParams) {
   return (await api.post<BacktestResponse>("/api/backtest/run", params)).data;
 }
@@ -303,8 +324,8 @@ export async function getMinuteDetail(query: string, tradeDate: string, assetTyp
   })).data;
 }
 
-export async function getStockWindow(code: string, centerDate: string, name?: string) {
+export async function getStockWindow(code: string, centerDate: string, name?: string, radius = 1) {
   return (await api.get<StockWindowResponse>(`/api/stocks/${code}/window`, {
-    params: { center_date: centerDate, radius: 5, freq: "1min", name }
+    params: { center_date: centerDate, radius, freq: "1min", name }
   })).data;
 }

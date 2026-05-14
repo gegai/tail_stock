@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # 默认基准指数，目前使用沪深300。
     benchmark_code: str = "000300.SH"
 
+    # Tushare Pro token。配置环境变量 TUSHARE_TOKEN 后，“真实选股”接口会用它拉取
+    # 大盘和入选股票的实时/准实时行情快照；未配置时接口会明确提示。
+    tushare_token: str = ""
+
     # 以下默认参数主要作为后端兜底。前端表单通常会显式传入对应值。
     default_lookback_days: int = 20
     default_take_profit_pct: float = 3.0
